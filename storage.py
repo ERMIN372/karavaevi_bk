@@ -140,7 +140,7 @@ USERS_COLUMNS = {name: idx + 1 for idx, name in enumerate(USERS_HEADERS)}
 def _load_shops_cache() -> Dict[int, str]:
     if _shops_ws is None:
         raise RuntimeError("Shops worksheet not initialized")
-    values = _shops_ws.get_all_records()
+    values = _shops_ws.get_all_records(expected_headers=SHOPS_HEADERS)
     cache: Dict[int, str] = {}
     for idx, row in enumerate(values, start=2):
         raw_id = row.get("id") or ""
@@ -289,7 +289,7 @@ def _guard_rate_limit_sync(author_user_id: int) -> bool:
     _ensure_initialized()
     now = datetime.now(timezone.utc)
     threshold = now - timedelta(hours=24)
-    records = _requests_ws.get_all_records()
+    records = _requests_ws.get_all_records(expected_headers=REQUESTS_HEADERS)
     count = 0
     for record in records:
         if str(record.get("author_id") or "").strip() != str(author_user_id):
