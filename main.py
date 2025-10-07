@@ -611,7 +611,7 @@ def main() -> None:
             on_shutdown=on_shutdown,
             host=WEBAPP_HOST,
             port=WEBAPP_PORT,
-            app=app,
+            web_app=app,
         )
     else:
         logging.info("Запуск в polling режиме (для разработки)")
