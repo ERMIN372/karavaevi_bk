@@ -4,3 +4,4 @@ key.json
 *.b64
 *.pem
 attached_assets/
+replacements.txt
