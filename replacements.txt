@@ -1,0 +1,3 @@
+regex:-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----==REDACTED_GCP_KEY
+regex:\b[0-9]{8,}:[A-Za-z0-9_-]{35,}\b==REDACTED_TG_TOKEN
+regex:AIza[0-9A-Za-z_-]{35}==REDACTED_API_KEY

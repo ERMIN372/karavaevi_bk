@@ -1,0 +1,6 @@
+.env
+env.*
+key.json
+*.b64
+*.pem
+attached_assets/
