@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -538,6 +539,14 @@ async def on_startup(_: Dispatcher) -> None:
         webhook_url = WEBHOOK_URL + WEBHOOK_PATH
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
         logging.info("Webhook установлен на %s", webhook_url)
+        info = await bot.get_webhook_info()
+        logging.info(
+            "Webhook состояние: pending=%s, ip=%s, last_error_date=%s, last_error_message=%s",
+            info.pending_update_count,
+            info.ip_address,
+            info.last_error_date,
+            info.last_error_message,
+        )
     else:
         logging.warning("WEBHOOK_URL не установлен, используется polling режим")
 
@@ -554,9 +563,46 @@ def register_handlers() -> None:
     dp.register_callback_query_handler(on_callback_pick, lambda c: c.data and c.data.startswith("pick:"))
 
 
+async def _handle_health(_: web.Request) -> web.Response:
+    """Простая проверка доступности вебхука."""
+    try:
+        info = await bot.get_webhook_info()
+        payload: Dict[str, Any] = {
+            "status": "ok",
+            "webhook_url": info.url,
+            "has_custom_certificate": info.has_custom_certificate,
+            "pending_update_count": info.pending_update_count,
+            "ip_address": info.ip_address,
+            "last_error_date": info.last_error_date,
+            "last_error_message": info.last_error_message,
+            "max_connections": info.max_connections,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Не удалось получить состояние вебхука")
+        payload = {"status": "error", "detail": str(exc)}
+    return web.json_response(payload)
+
+
+async def _handle_root(_: web.Request) -> web.Response:
+    logging.info("Получен запрос к debug root")
+    return web.json_response({
+        "status": "running",
+        "timestamp": datetime.now(TIMEZONE).isoformat(),
+        "webhook_path": WEBHOOK_PATH,
+    })
+
+
+def build_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", _handle_root)
+    app.router.add_get("/healthz", _handle_health)
+    return app
+
+
 def main() -> None:
     register_handlers()
     if WEBHOOK_URL:
+        app = build_web_app()
         executor.start_webhook(
             dispatcher=dp,
             webhook_path=WEBHOOK_PATH,
@@ -565,6 +611,7 @@ def main() -> None:
             on_shutdown=on_shutdown,
             host=WEBAPP_HOST,
             port=WEBAPP_PORT,
+            app=app,
         )
     else:
         logging.info("Запуск в polling режиме (для разработки)")
