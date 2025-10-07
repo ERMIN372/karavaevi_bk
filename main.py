@@ -1,9 +1,8 @@
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -14,17 +13,23 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from aiogram.utils import executor
 from dotenv import load_dotenv
 
+from zoneinfo import ZoneInfo
+
+import storage
+
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 TECH_CHAT_ID = int(os.getenv("TECH_CHAT_ID", "0"))
+TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 ADMINS = {
     int(user_id)
     for user_id in os.getenv("ADMINS", "").split(",")
     if user_id.strip().isdigit()
 }
+RATE_LIMIT_PER_DAY = storage.RATE_LIMIT_PER_DAY
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -32,10 +37,8 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+fsm_storage = MemoryStorage()
+dp = Dispatcher(bot, storage=fsm_storage)
 
 
 class DirectorStates(StatesGroup):
@@ -50,67 +53,22 @@ class WorkerStates(StatesGroup):
     date = State()
     time_from = State()
     time_to = State()
-    shop = State()
     note = State()
     confirm = State()
 
 
-async def init_db(conn: aiosqlite.Connection) -> None:
-    await conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL,
-            phone TEXT,
-            shop TEXT
-        );
-        CREATE TABLE IF NOT EXISTS shops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-        );
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            date TEXT NOT NULL,
-            time_from TEXT NOT NULL,
-            time_to TEXT NOT NULL,
-            shop_id INTEGER NOT NULL,
-            note TEXT,
-            author_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(shop_id) REFERENCES shops(id),
-            FOREIGN KEY(author_id) REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            payload TEXT,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-    await conn.commit()
-
-    async with conn.execute("SELECT COUNT(*) FROM shops") as cursor:
-        row = await cursor.fetchone()
-        if row and row[0] == 0:
-            await conn.executemany(
-                "INSERT INTO shops(name) VALUES (?)",
-                [(f"Лавка №{i}",) for i in range(1, 11)],
-            )
-            await conn.commit()
-            logging.info("Создан справочник лавок")
-
-
-async def ensure_user(ctx: types.User) -> None:
+async def ensure_user(ctx: types.User) -> str:
     role = "director" if ctx.id in ADMINS else "worker"
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "INSERT INTO users(id, role) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET role=excluded.role",
-            (ctx.id, role),
-        )
-        await conn.commit()
+    await storage.gs_ensure_user(
+        {
+            "id": ctx.id,
+            "role": role,
+            "username": ctx.username,
+            "first_name": ctx.first_name,
+            "last_name": ctx.last_name,
+        }
+    )
+    return role
 
 
 def build_start_keyboard() -> ReplyKeyboardMarkup:
@@ -140,19 +98,10 @@ def format_mention(entity: Any) -> str:
 
 
 async def guard_rate_limit(user_id: int) -> bool:
-    threshold = datetime.utcnow() - timedelta(hours=24)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute(
-            """
-            SELECT COUNT(*) FROM requests
-            WHERE author_id = ?
-              AND created_at >= ?
-              AND status IN ('open', 'assigned', 'picked')
-            """,
-            (user_id, threshold.isoformat()),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return (row or (0,))[0] < 3
+    allowed = await storage.guard_rate_limit_gs(user_id)
+    if not allowed:
+        logging.info("User %s hit rate limit %s", user_id, RATE_LIMIT_PER_DAY)
+    return allowed
 
 
 def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) -> Optional[str]:
@@ -161,7 +110,7 @@ def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) ->
     except ValueError:
         return "Дата должна быть в формате ГГГГ-ММ-ДД."
 
-    today = datetime.utcnow().date()
+    today = datetime.now(TIMEZONE).date()
     if date_obj < today:
         return "Дата не может быть в прошлом."
 
@@ -196,18 +145,17 @@ async def send_tech(message: str) -> None:
 
 
 async def fetch_shops() -> Dict[int, str]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute("SELECT id, name FROM shops ORDER BY id") as cursor:
-            return {row[0]: row[1] for row in await cursor.fetchall()}
+    return storage.get_shops()
 
 
 def render_channel_post(record: Dict[str, Any]) -> str:
+    shop_name = record.get("shop_name") or "Любая лавка"
     if record["kind"] == "director":
         title = "🔔 Заявка от директора лавки"
         note = record.get("note") or "Без комментариев"
         return (
             f"{title}\n"
-            f"Лавка: {record['shop_name']}\n"
+            f"Лавка: {shop_name}\n"
             f"Дата: {record['date']}\n"
             f"Смена: {record['time_from']}–{record['time_to']}\n"
             f"Комментарий: {note}\n"
@@ -217,84 +165,12 @@ def render_channel_post(record: Dict[str, Any]) -> str:
     note = record.get("note") or "Без комментариев"
     return (
         f"{title}\n"
-        f"Лавка: {record['shop_name']}\n"
+        f"Лавка: {shop_name}\n"
         f"Дата: {record['date']}\n"
         f"Смена: {record['time_from']}–{record['time_to']}\n"
         f"Пожелания: {note}\n"
         "Нажмите «Пригласить», чтобы связаться с сотрудником."
     )
-
-
-async def record_event(kind: str, payload: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "INSERT INTO events(kind, payload, created_at) VALUES(?, ?, ?)",
-            (kind, payload, datetime.utcnow().isoformat()),
-        )
-        await conn.commit()
-
-
-async def create_request(data: Dict[str, Any]) -> int:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        cursor = await conn.execute(
-            """
-            INSERT INTO requests(kind, date, time_from, time_to, shop_id, note, author_id, status, created_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """,
-            (
-                data["kind"],
-                data["date"],
-                data["time_from"],
-                data["time_to"],
-                data["shop_id"],
-                data.get("note"),
-                data["author_id"],
-                datetime.utcnow().isoformat(),
-            ),
-        )
-        await conn.commit()
-        request_id = cursor.lastrowid
-    await record_event("request_created", f"{{'id': {request_id}, 'kind': '{data['kind']}'}}")
-    return request_id
-
-
-async def fetch_request(request_id: int) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute(
-            """
-            SELECT r.id, r.kind, r.date, r.time_from, r.time_to, r.shop_id, r.note,
-                   r.author_id, r.status, s.name as shop_name
-            FROM requests r
-            JOIN shops s ON s.id = r.shop_id
-            WHERE r.id = ?
-            """,
-            (request_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            columns = [
-                "id",
-                "kind",
-                "date",
-                "time_from",
-                "time_to",
-                "shop_id",
-                "note",
-                "author_id",
-                "status",
-                "shop_name",
-            ]
-            return dict(zip(columns, row))
-
-
-async def update_request_status(request_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "UPDATE requests SET status = ? WHERE id = ?",
-            (status, request_id),
-        )
-        await conn.commit()
 
 
 async def on_callback_pick(call: CallbackQuery) -> None:
@@ -306,13 +182,13 @@ async def on_callback_pick(call: CallbackQuery) -> None:
         return
 
     try:
-        record = await fetch_request(request_id)
+        record = await storage.gs_find_request(request_id)
         if not record:
             await call.answer("Заявка не найдена или была удалена.", show_alert=True)
             return
 
-        if record["status"] != "open":
-            await call.answer("Эта заявка уже закрыта.", show_alert=True)
+        if str(record.get("status")) != "open":
+            await call.answer("Карточка уже закрыта.", show_alert=True)
             return
 
         picker = call.from_user
@@ -345,8 +221,8 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 f"Свяжитесь с директором: {author_mention}"
             )
 
-        await update_request_status(request_id, new_status)
-        await record_event("request_status", f"{{'id': {request_id}, 'status': '{new_status}'}}")
+        channel_message_id = call.message.message_id if call.message else None
+        await storage.gs_update_request_status(request_id, new_status, channel_message_id)
 
         try:
             await bot.send_message(
@@ -382,12 +258,19 @@ async def handle_post_publication(
 ) -> None:
     data = await state.get_data()
     shop_id = data.get("shop_id")
+    shop_name = data.get("shop_name")
     shops = await fetch_shops()
-    if shop_id not in shops:
-        await bot.send_message(chat_id, "Не удалось определить лавку. Попробуйте начать заново.")
-        await state.finish()
-        return
-    shop_name = shops[shop_id]
+    if shop_id is not None:
+        if shop_id not in shops:
+            await bot.send_message(
+                chat_id,
+                "Не удалось определить лавку. Попробуйте начать заново.",
+            )
+            await state.finish()
+            return
+        shop_name = shops[shop_id]
+    elif not shop_name:
+        shop_name = "Любая лавка"
     payload = {
         "kind": kind,
         "date": data.get("date"),
@@ -397,6 +280,7 @@ async def handle_post_publication(
         "note": data.get("note"),
         "author_id": author.id,
         "shop_name": shop_name,
+        "status": "open",
     }
 
     allowed = await guard_rate_limit(author.id)
@@ -405,14 +289,24 @@ async def handle_post_publication(
         await state.finish()
         return
 
-    request_id = await create_request(payload)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload["created_at"] = now_iso
+    payload["updated_at"] = now_iso
+    request_id, _ = await storage.gs_append_request(payload)
     payload["id"] = request_id
     text = render_channel_post(payload)
     button_text = "Откликнуться" if kind == "director" else "Пригласить"
     markup = InlineKeyboardMarkup().add(
         InlineKeyboardButton(button_text, callback_data=f"pick:{request_id}")
     )
-    await bot.send_message(CHANNEL_ID, text, reply_markup=markup)
+    channel_message = await bot.send_message(CHANNEL_ID, text, reply_markup=markup)
+    try:
+        await storage.gs_update_request_status(
+            request_id, "open", channel_message_id=channel_message.message_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Failed to update channel message id for request %s", request_id)
+        await send_tech(f"Не удалось сохранить ссылку на пост {request_id}: {exc}")
     await bot.send_message(
         chat_id,
         "Готово! Заявка опубликована в канале.",
@@ -464,6 +358,13 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             await DirectorStates.date.set()
             return
         shops = await fetch_shops()
+        if not shops:
+            await message.answer(
+                "Список лавок пуст. Обратитесь к администратору для настройки справочника.",
+                reply_markup=build_start_keyboard(),
+            )
+            await state.finish()
+            return
         keyboard = InlineKeyboardMarkup(row_width=2)
         for shop_id, shop_name in shops.items():
             keyboard.insert(
@@ -479,7 +380,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             await call.answer("Такой лавки нет.", show_alert=True)
             return
         await call.answer()
-        await state.update_data(shop_id=shop_id)
+        await state.update_data(shop_id=shop_id, shop_name=shops[shop_id])
         await call.message.edit_text("Добавьте комментарий (можно телефон). Если не нужно, напишите «Без комментариев».")
         await DirectorStates.next()
 
@@ -488,11 +389,12 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         await state.update_data(note=message.text.strip())
         data = await state.get_data()
         shops = await fetch_shops()
+        shop_name = data.get("shop_name") or shops.get(data.get("shop_id"), "Не выбрана")
         summary = (
             "Проверьте заявку:\n"
             f"Дата: {data['date']}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
-            f"Лавка: {shops.get(data['shop_id'], 'Не выбрана')}\n"
+            f"Лавка: {shop_name}\n"
             f"Комментарий: {data['note']}"
         )
         keyboard = InlineKeyboardMarkup().add(
@@ -550,17 +452,27 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         keyboard = InlineKeyboardMarkup(row_width=2)
         for shop_id, shop_name in shops.items():
             keyboard.insert(InlineKeyboardButton(shop_name, callback_data=f"worker_shop:{shop_id}"))
+        keyboard.add(InlineKeyboardButton("Любая лавка", callback_data="worker_shop:any"))
         await message.answer("Выберите желаемую лавку:", reply_markup=keyboard)
 
     @dispatcher.callback_query_handler(lambda c: c.data.startswith("worker_shop:"), state=WorkerStates.time_to)
     async def worker_shop_choice(call: CallbackQuery, state: FSMContext) -> None:
-        shop_id = int(call.data.split(":", 1)[1])
-        shops = await fetch_shops()
-        if shop_id not in shops:
-            await call.answer("Такой лавки нет.", show_alert=True)
-            return
-        await call.answer()
-        await state.update_data(shop_id=shop_id)
+        _, raw_id = call.data.split(":", 1)
+        if raw_id == "any":
+            await call.answer()
+            await state.update_data(shop_id=None, shop_name="Любая лавка")
+        else:
+            try:
+                shop_id = int(raw_id)
+            except ValueError:
+                await call.answer("Такой лавки нет.", show_alert=True)
+                return
+            shops = await fetch_shops()
+            if shop_id not in shops:
+                await call.answer("Такой лавки нет.", show_alert=True)
+                return
+            await call.answer()
+            await state.update_data(shop_id=shop_id, shop_name=shops[shop_id])
         await call.message.edit_text("Расскажите, на какую роль готовы выйти и оставьте комментарий (можно телефон).")
         await WorkerStates.next()
 
@@ -569,11 +481,12 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         await state.update_data(note=message.text.strip())
         data = await state.get_data()
         shops = await fetch_shops()
+        shop_name = data.get("shop_name") or shops.get(data.get("shop_id"), "Любая лавка")
         summary = (
             "Проверьте заявку:\n"
             f"Дата: {data['date']}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
-            f"Лавка: {shops.get(data['shop_id'], 'Не выбрана')}\n"
+            f"Лавка: {shop_name}\n"
             f"Пожелания: {data['note']}"
         )
         keyboard = InlineKeyboardMarkup().add(
@@ -610,9 +523,8 @@ async def on_error(update: types.Update, error: Exception) -> bool:
 
 
 async def on_startup(_: Dispatcher) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await init_db(conn)
-    logging.info("Бот запущен и готов к работе")
+    shops = storage.get_shops()
+    logging.info("Бот запущен и готов к работе. Доступно лавок: %s", len(shops))
 
 
 def register_handlers() -> None:
