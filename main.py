@@ -237,7 +237,8 @@ async def on_callback_pick(call: CallbackQuery) -> None:
             await call.answer("Заявка не найдена или была удалена.", show_alert=True)
             return
 
-        if str(record.get("status")) != "open":
+        status = str(record.get("status") or "").strip().lower()
+        if status != "open":
             await call.answer("Карточка уже закрыта.", show_alert=True)
             return
 
