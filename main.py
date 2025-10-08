@@ -269,7 +269,6 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 f"Свяжитесь с директором: {author_contact}"
             )
             message_for_picker = (
-                "✅ Сотрудник откликнулся на вашу заявку!\n"
                 f"Контакт: {picker_contact}"
             )
 
