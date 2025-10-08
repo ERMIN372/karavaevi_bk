@@ -30,7 +30,6 @@ ADMINS = {
     for user_id in os.getenv("ADMINS", "").split(",")
     if user_id.strip().isdigit()
 }
-RATE_LIMIT_PER_DAY = storage.RATE_LIMIT_PER_DAY
 
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "5000"))
@@ -105,13 +104,6 @@ def format_mention(entity: Any) -> str:
         last_name = getattr(entity, "last_name", None)
         full_name = " ".join(filter(None, [first_name, last_name])) or "Пользователь"
     return f'<a href="tg://user?id={entity.id}">{full_name}</a>'
-
-
-async def guard_rate_limit(user_id: int) -> bool:
-    allowed = await storage.guard_rate_limit_gs(user_id)
-    if not allowed:
-        logging.info("User %s hit rate limit %s", user_id, RATE_LIMIT_PER_DAY)
-    return allowed
 
 
 def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) -> Optional[str]:
@@ -292,12 +284,6 @@ async def handle_post_publication(
         "shop_name": shop_name,
         "status": "open",
     }
-
-    allowed = await guard_rate_limit(author.id)
-    if not allowed:
-        await bot.send_message(chat_id, "Лимит заявок на сегодня достигнут.")
-        await state.finish()
-        return
 
     now_iso = datetime.now(timezone.utc).isoformat()
     payload["created_at"] = now_iso

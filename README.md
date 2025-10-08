@@ -21,7 +21,6 @@ Python 3.11 с хранением данных в Google Sheets.
 | `TECH_CHAT_ID` | ID тех. чата для уведомлений об ошибках |
 | `ADMINS` | Список ID директоров через запятую |
 | `TIMEZONE` | Часовой пояс для валидации дат (например, `Europe/Moscow`) |
-| `RATE_LIMIT_PER_DAY` | Лимит заявок на пользователя в сутки |
 | `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64` | Base64 JSON сервисного аккаунта Google |
 | `GOOGLE_SPREADSHEET_ID` | ID таблицы Google Sheets |
 
