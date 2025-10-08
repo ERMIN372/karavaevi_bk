@@ -99,6 +99,26 @@ def build_contact_keyboard() -> ReplyKeyboardMarkup:
     return keyboard
 
 
+async def ensure_contact_exists(message: types.Message) -> bool:
+    user_record = await storage.gs_get_user(message.from_user.id)
+    raw_phone = (user_record or {}).get("phone_number") if user_record else ""
+    if isinstance(raw_phone, str):
+        phone_number = raw_phone.strip()
+    elif raw_phone:
+        phone_number = str(raw_phone).strip()
+    else:
+        phone_number = ""
+    await ensure_user(message.from_user, phone_number=phone_number or None)
+    if phone_number:
+        return True
+    await message.answer(
+        "Для регистрации поделитесь, пожалуйста, своим контактом.",
+        reply_markup=build_contact_keyboard(),
+    )
+    await RegistrationStates.waiting_contact.set()
+    return False
+
+
 async def start_menu(message: types.Message) -> None:
     text = "👋 Привет! Это бот подработок сети «Братья Караваевы»."
     text += "\nВыберите нужный режим:"
@@ -349,8 +369,10 @@ async def handle_post_publication(
 
 def run_director_flow(dispatcher: Dispatcher) -> None:
     @dispatcher.message_handler(lambda m: m.text == "Я директор лавки")
-    async def director_entry(message: types.Message) -> None:
-        await ensure_user(message.from_user)
+    async def director_entry(message: types.Message, state: FSMContext) -> None:
+        if not await ensure_contact_exists(message):
+            return
+        await state.finish()
         if message.from_user.id not in ADMINS:
             await message.answer(
                 "Доступ только для директоров. Если считаете, что это ошибка — обратитесь в поддержку."
@@ -445,8 +467,10 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
 
 def run_worker_flow(dispatcher: Dispatcher) -> None:
     @dispatcher.message_handler(lambda m: m.text == "Я сотрудник лавки")
-    async def worker_entry(message: types.Message) -> None:
-        await ensure_user(message.from_user)
+    async def worker_entry(message: types.Message, state: FSMContext) -> None:
+        if not await ensure_contact_exists(message):
+            return
+        await state.finish()
         await message.answer(
             "Укажите дату, когда готовы выйти, в формате ГГГГ-ММ-ДД:",
             reply_markup=ReplyKeyboardRemove(),
@@ -537,16 +561,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
-    user_record = await storage.gs_get_user(message.from_user.id)
-    phone_number = (user_record or {}).get("phone_number", "") if user_record else ""
-    phone_number = phone_number.strip()
-    await ensure_user(message.from_user, phone_number=phone_number or None)
-    if not phone_number:
-        await message.answer(
-            "Для регистрации поделитесь, пожалуйста, своим контактом.",
-            reply_markup=build_contact_keyboard(),
-        )
-        await RegistrationStates.waiting_contact.set()
+    if not await ensure_contact_exists(message):
         return
     await state.finish()
     await start_menu(message)
