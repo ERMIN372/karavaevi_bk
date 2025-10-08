@@ -199,6 +199,12 @@ def _normalize_text(value: str) -> str:
     return text
 
 
+def _matches_date_pick_button(text: Optional[str]) -> bool:
+    if text is None:
+        return False
+    return _normalize_text(text) == _normalize_text(DATE_BUTTON_PICK)
+
+
 def parse_user_date_input(raw_value: str, *, today: date, max_days: int) -> date:
     if not raw_value:
         raise ValueError("empty")
@@ -371,8 +377,7 @@ async def process_date_message(message: types.Message, state: FSMContext) -> Non
             message.from_user.id if message.from_user else "unknown",
         )
         return
-    normalized_text = (message.text or "").strip().lower()
-    if normalized_text == DATE_BUTTON_PICK.lower():
+    if _matches_date_pick_button(message.text):
         await send_inline_date_choices(message)
         return
     today_local = datetime.now(TIMEZONE).date()
@@ -759,7 +764,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         await start_date_step(message, state, "director")
 
     @dispatcher.message_handler(
-        lambda m: (m.text or "").strip().lower() == DATE_BUTTON_PICK.lower(),
+        lambda m: _matches_date_pick_button(m.text),
         state=DirectorStates.date,
     )
     async def director_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
@@ -875,7 +880,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         await start_date_step(message, state, "worker")
 
     @dispatcher.message_handler(
-        lambda m: (m.text or "").strip().lower() == DATE_BUTTON_PICK.lower(),
+        lambda m: _matches_date_pick_button(m.text),
         state=WorkerStates.date,
     )
     async def worker_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
