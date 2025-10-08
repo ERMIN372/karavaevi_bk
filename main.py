@@ -373,11 +373,6 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         if not await ensure_contact_exists(message):
             return
         await state.finish()
-        if message.from_user.id not in ADMINS:
-            await message.answer(
-                "Доступ только для директоров. Если считаете, что это ошибка — обратитесь в поддержку."
-            )
-            return
         await message.answer(
             "Укажите дату смены в формате ГГГГ-ММ-ДД:",
             reply_markup=ReplyKeyboardRemove(),
