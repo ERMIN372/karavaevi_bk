@@ -201,7 +201,7 @@ async def fetch_shops() -> Dict[int, str]:
 def render_channel_post(record: Dict[str, Any]) -> str:
     shop_name = record.get("shop_name") or "Любая лавка"
     if record["kind"] == "director":
-        title = "🔔 Заявка от директора лавки"
+        title = "🔔 Заявка на подработку от директора лавки"
         note = record.get("note") or "Без комментариев"
         return (
             f"{title}\n"
@@ -269,6 +269,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 f"Свяжитесь с директором: {picker_contact}"
             )
             message_for_picker = (
+                "🎉 Вы пригласили сотрудника на смену!\n"
                 f"Контакт: {author_contact}"
             )
 
@@ -354,7 +355,7 @@ async def handle_post_publication(
         await send_tech(f"Не удалось сохранить ссылку на пост {request_id}: {exc}")
     await bot.send_message(
         chat_id,
-        "Готово! Заявка опубликована в канале.",
+        "Готово! Заявка опубликована в канале: @karavaevi_bk.",
         reply_markup=build_start_keyboard(),
     )
     logging.info(
@@ -412,7 +413,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             keyboard.insert(
                 InlineKeyboardButton(shop_name, callback_data=f"director_shop:{shop_id}")
             )
-        await message.answer("Выберите лавку:", reply_markup=keyboard)
+        await message.answer("Выберите вашу лавку:", reply_markup=keyboard)
 
     @dispatcher.callback_query_handler(lambda c: c.data.startswith("director_shop:"), state=DirectorStates.time_to)
     async def director_shop_choice(call: CallbackQuery, state: FSMContext) -> None:
@@ -497,7 +498,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         for shop_id, shop_name in shops.items():
             keyboard.insert(InlineKeyboardButton(shop_name, callback_data=f"worker_shop:{shop_id}"))
         keyboard.add(InlineKeyboardButton("Любая лавка", callback_data="worker_shop:any"))
-        await message.answer("Выберите желаемую лавку:", reply_markup=keyboard)
+        await message.answer("Выберите лавку, в которой вы работаете:", reply_markup=keyboard)
 
     @dispatcher.callback_query_handler(lambda c: c.data.startswith("worker_shop:"), state=WorkerStates.time_to)
     async def worker_shop_choice(call: CallbackQuery, state: FSMContext) -> None:
@@ -517,7 +518,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
                 return
             await call.answer()
             await state.update_data(shop_id=shop_id, shop_name=shops[shop_id])
-        await call.message.edit_text("Расскажите, на какую роль готовы выйти и оставьте комментарий (можно телефон).")
+        await call.message.edit_text("Расскажите, на какую роль готовы выйти и оставьте комментарий.")
         await WorkerStates.next()
 
     @dispatcher.message_handler(state=WorkerStates.note)
