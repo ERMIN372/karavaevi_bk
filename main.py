@@ -254,23 +254,23 @@ async def on_callback_pick(call: CallbackQuery) -> None:
 
         if record["kind"] == "director":
             new_status = "assigned"
-            director_message = (
+            message_for_author = (
                 "✅ Сотрудник откликнулся на вашу заявку!\n"
                 f"Контакт: {picker_contact}"
             )
-            worker_message = (
+            message_for_picker = (
                 "🎉 Вы откликнулись на смену!\n"
                 f"Свяжитесь с директором: {author_contact}"
             )
         else:
             new_status = "picked"
-            director_message = (
-                "🎯 Вы пригласили сотрудника на смену!\n"
-                f"Контакт: {picker_contact}"
-            )
-            worker_message = (
+            message_for_author = (
                 "✅ Директор пригласил вас на смену!\n"
                 f"Свяжитесь с директором: {author_contact}"
+            )
+            message_for_picker = (
+                "🎯 Вы пригласили сотрудника на смену!\n"
+                f"Контакт: {picker_contact}"
             )
 
         channel_message_id = call.message.message_id if call.message else None
@@ -278,7 +278,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
 
         try:
             await bot.send_message(
-                record["author_id"], director_message, disable_web_page_preview=True
+                record["author_id"], message_for_author, disable_web_page_preview=True
             )
         except Exception as exc:  # noqa: BLE001
             logging.exception("Не удалось уведомить автора заявки %s", record["author_id"])
@@ -288,7 +288,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
 
         try:
             await bot.send_message(
-                picker.id, worker_message, disable_web_page_preview=True
+                picker.id, message_for_picker, disable_web_page_preview=True
             )
         except Exception as exc:  # noqa: BLE001
             logging.exception("Не удалось уведомить участника %s", picker.id)
