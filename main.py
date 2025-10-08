@@ -848,6 +848,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         await call.answer("Заявка отменена")
         await state.finish()
         await call.message.edit_text("Заявка отменена. Возвращайтесь, когда будете готовы.")
+        await start_menu(call.message)
 
     @dispatcher.callback_query_handler(lambda c: c.data == "director_confirm", state=DirectorStates.confirm)
     async def director_confirm(call: CallbackQuery, state: FSMContext) -> None:
@@ -960,6 +961,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         await call.answer("Заявка отменена")
         await state.finish()
         await call.message.edit_text("Заявка отменена. Возвращайтесь, когда будете готовы.")
+        await start_menu(call.message)
 
     @dispatcher.callback_query_handler(lambda c: c.data == "worker_confirm", state=WorkerStates.confirm)
     async def worker_confirm(call: CallbackQuery, state: FSMContext) -> None:
