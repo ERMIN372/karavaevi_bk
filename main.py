@@ -266,10 +266,10 @@ async def on_callback_pick(call: CallbackQuery) -> None:
             new_status = "picked"
             message_for_author = (
                 "✅ Директор пригласил вас на смену!\n"
-                f"Свяжитесь с директором: {author_contact}"
+                f"Свяжитесь с директором: {picker_contact}"
             )
             message_for_picker = (
-                f"Контакт: {picker_contact}"
+                f"Контакт: {author_contact}"
             )
 
         channel_message_id = call.message.message_id if call.message else None
