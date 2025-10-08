@@ -8,9 +8,9 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, ReplyKeyboardMarkup,
-                           ReplyKeyboardRemove)
+from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton,
+                           ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from aiogram.utils import executor
 from dotenv import load_dotenv
 
@@ -66,13 +66,19 @@ class WorkerStates(StatesGroup):
     confirm = State()
 
 
-async def ensure_user(ctx: types.User) -> str:
+class RegistrationStates(StatesGroup):
+    waiting_contact = State()
+
+
+async def ensure_user(ctx: types.User, phone_number: Optional[str] = None) -> str:
     role = "director" if ctx.id in ADMINS else "worker"
+    username = (ctx.username or "").lstrip("@")
     await storage.gs_ensure_user(
         {
             "id": ctx.id,
             "role": role,
-            "username": ctx.username,
+            "username": username,
+            "phone_number": phone_number,
             "first_name": ctx.first_name,
             "last_name": ctx.last_name,
         }
@@ -84,6 +90,12 @@ def build_start_keyboard() -> ReplyKeyboardMarkup:
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add("Я директор лавки")
     keyboard.add("Я сотрудник лавки")
+    return keyboard
+
+
+def build_contact_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add(KeyboardButton("Отправить контакт ☎️", request_contact=True))
     return keyboard
 
 
@@ -104,6 +116,22 @@ def format_mention(entity: Any) -> str:
         last_name = getattr(entity, "last_name", None)
         full_name = " ".join(filter(None, [first_name, last_name])) or "Пользователь"
     return f'<a href="tg://user?id={entity.id}">{full_name}</a>'
+
+
+def format_contact_details(
+    user_data: Optional[Dict[str, Any]], entity: Any
+) -> str:
+    phone_number = (user_data or {}).get("phone_number", "").strip()
+    username = (user_data or {}).get("username") or getattr(entity, "username", None)
+    contact_parts = []
+    if phone_number:
+        contact_parts.append(phone_number)
+    if username:
+        username = username.lstrip("@")
+        contact_parts.append(f"@{username}")
+    if contact_parts:
+        return " ".join(contact_parts)
+    return format_mention(entity)
 
 
 def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) -> Optional[str]:
@@ -199,28 +227,30 @@ async def on_callback_pick(call: CallbackQuery) -> None:
             return
 
         author_chat = await bot.get_chat(record["author_id"])
-        author_mention = format_mention(author_chat)
-        picker_mention = format_mention(picker)
+        picker_user_data = await storage.gs_get_user(picker.id)
+        author_user_data = await storage.gs_get_user(record["author_id"])
+        picker_contact = format_contact_details(picker_user_data, picker)
+        author_contact = format_contact_details(author_user_data, author_chat)
 
         if record["kind"] == "director":
             new_status = "assigned"
             director_message = (
                 "✅ Сотрудник откликнулся на вашу заявку!\n"
-                f"Контакт: {picker_mention}"
+                f"Контакт: {picker_contact}"
             )
             worker_message = (
                 "🎉 Вы откликнулись на смену!\n"
-                f"Свяжитесь с директором: {author_mention}"
+                f"Свяжитесь с директором: {author_contact}"
             )
         else:
             new_status = "picked"
             director_message = (
                 "🎯 Вы пригласили сотрудника на смену!\n"
-                f"Контакт: {picker_mention}"
+                f"Контакт: {picker_contact}"
             )
             worker_message = (
                 "✅ Директор пригласил вас на смену!\n"
-                f"Свяжитесь с директором: {author_mention}"
+                f"Свяжитесь с директором: {author_contact}"
             )
 
         channel_message_id = call.message.message_id if call.message else None
@@ -506,9 +536,45 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
 
 
 @dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message) -> None:
-    await ensure_user(message.from_user)
+async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    user_record = await storage.gs_get_user(message.from_user.id)
+    phone_number = (user_record or {}).get("phone_number", "") if user_record else ""
+    phone_number = phone_number.strip()
+    await ensure_user(message.from_user, phone_number=phone_number or None)
+    if not phone_number:
+        await message.answer(
+            "Для регистрации поделитесь, пожалуйста, своим контактом.",
+            reply_markup=build_contact_keyboard(),
+        )
+        await RegistrationStates.waiting_contact.set()
+        return
+    await state.finish()
     await start_menu(message)
+
+
+@dp.message_handler(content_types=ContentType.CONTACT, state=RegistrationStates.waiting_contact)
+async def registration_contact(message: types.Message, state: FSMContext) -> None:
+    contact = message.contact
+    if not contact or contact.user_id != message.from_user.id:
+        await message.answer(
+            "Пожалуйста, отправьте контакт, используя кнопку «Отправить контакт ☎️».",
+            reply_markup=build_contact_keyboard(),
+        )
+        return
+    await ensure_user(message.from_user, phone_number=contact.phone_number)
+    await state.finish()
+    await message.answer(
+        "Спасибо! Контакт сохранён.", reply_markup=ReplyKeyboardRemove()
+    )
+    await start_menu(message)
+
+
+@dp.message_handler(state=RegistrationStates.waiting_contact)
+async def registration_waiting(message: types.Message) -> None:
+    await message.answer(
+        "Чтобы продолжить, поделитесь, пожалуйста, своим контактом.",
+        reply_markup=build_contact_keyboard(),
+    )
 
 
 @dp.errors_handler()
