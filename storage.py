@@ -219,7 +219,9 @@ def _update_request_status_sync(
 ) -> None:
     _ensure_initialized()
     try:
-        cell = _requests_ws.find(str(request_id))
+        cell = _requests_ws.find(
+            str(request_id), in_column=REQUESTS_COLUMNS["id"]
+        )
     except gspread.exceptions.CellNotFound:
         raise KeyError(f"Request {request_id} not found")
 
@@ -238,14 +240,13 @@ def _update_request_status_sync(
             "values": [[datetime.now(timezone.utc).isoformat()]],
         }
     )
-    if channel_message_id is not None:
-        channel_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["channel_message_id"])
-        updates.append(
-            {
-                "range": channel_cell,
-                "values": [[str(channel_message_id)]],
-            }
-        )
+    channel_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["channel_message_id"])
+    updates.append(
+        {
+            "range": channel_cell,
+            "values": [["" if channel_message_id is None else str(channel_message_id)]],
+        }
+    )
     _requests_ws.batch_update(updates)
     LOGGER.info("Updated request %s status to %s", request_id, status)
 
@@ -259,7 +260,9 @@ async def gs_update_request_status(
 def _find_request_sync(request_id: int) -> Optional[Dict[str, Any]]:
     _ensure_initialized()
     try:
-        cell = _requests_ws.find(str(request_id))
+        cell = _requests_ws.find(
+            str(request_id), in_column=REQUESTS_COLUMNS["id"]
+        )
     except gspread.exceptions.CellNotFound:
         return None
     row_values = _requests_ws.row_values(cell.row)
