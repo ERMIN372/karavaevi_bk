@@ -371,6 +371,10 @@ async def process_date_message(message: types.Message, state: FSMContext) -> Non
             message.from_user.id if message.from_user else "unknown",
         )
         return
+    normalized_text = (message.text or "").strip().lower()
+    if normalized_text == DATE_BUTTON_PICK.lower():
+        await send_inline_date_choices(message)
+        return
     today_local = datetime.now(TIMEZONE).date()
     try:
         parsed_date = parse_user_date_input(
