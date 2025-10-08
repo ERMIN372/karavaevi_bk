@@ -224,11 +224,16 @@ def _update_request_status_sync(
 
     updates = []
     status_cell = f"{_column_letter(REQUESTS_COLUMNS['status'])}{cell.row}"
-    updates.append({"range": f"{REQUESTS_SHEET}!{status_cell}", "values": [[status]]})
+    updates.append(
+        {
+            "range": f"{REQUESTS_SHEET}!{status_cell}:{status_cell}",
+            "values": [[status]],
+        }
+    )
     updated_at_cell = f"{_column_letter(REQUESTS_COLUMNS['updated_at'])}{cell.row}"
     updates.append(
         {
-            "range": f"{REQUESTS_SHEET}!{updated_at_cell}",
+            "range": f"{REQUESTS_SHEET}!{updated_at_cell}:{updated_at_cell}",
             "values": [[datetime.now(timezone.utc).isoformat()]],
         }
     )
@@ -236,7 +241,7 @@ def _update_request_status_sync(
         channel_cell = f"{_column_letter(REQUESTS_COLUMNS['channel_message_id'])}{cell.row}"
         updates.append(
             {
-                "range": f"{REQUESTS_SHEET}!{channel_cell}",
+                "range": f"{REQUESTS_SHEET}!{channel_cell}:{channel_cell}",
                 "values": [[str(channel_message_id)]],
             }
         )
