@@ -968,11 +968,12 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         await handle_post_publication(call.message.chat.id, call.from_user, state, "worker")
 
 
-@dp.message_handler(commands=["start"])
+@dp.message_handler(commands=["start"], state="*")
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    # Сбрасываем любые активные состояния, чтобы полностью перезапустить сценарий.
+    await state.finish()
     if not await ensure_contact_exists(message):
         return
-    await state.finish()
     await start_menu(message)
 
 
