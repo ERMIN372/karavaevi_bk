@@ -7,7 +7,7 @@ import base64
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import gspread
@@ -19,7 +19,6 @@ LOGGER = logging.getLogger(__name__)
 
 SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
-RATE_LIMIT_PER_DAY = int(os.getenv("RATE_LIMIT_PER_DAY", "3"))
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -291,35 +290,6 @@ async def gs_find_request(request_id: int) -> Optional[Dict[str, Any]]:
     return await asyncio.to_thread(_find_request_sync, request_id)
 
 
-def _guard_rate_limit_sync(author_user_id: int) -> bool:
-    _ensure_initialized()
-    now = datetime.now(timezone.utc)
-    threshold = now - timedelta(hours=24)
-    records = _requests_ws.get_all_records(expected_headers=REQUESTS_HEADERS)
-    count = 0
-    for record in records:
-        if str(record.get("author_id") or "").strip() != str(author_user_id):
-            continue
-        created_at = record.get("created_at")
-        if not created_at:
-            continue
-        try:
-            created = datetime.fromisoformat(created_at)
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        if created >= threshold:
-            count += 1
-            if count >= RATE_LIMIT_PER_DAY:
-                return False
-    return True
-
-
-async def guard_rate_limit_gs(author_user_id: int) -> bool:
-    return await asyncio.to_thread(_guard_rate_limit_sync, author_user_id)
-
-
 def _ensure_user_sync(user: Dict[str, Any]) -> None:
     _ensure_initialized()
     if not user or "id" not in user:
@@ -355,11 +325,9 @@ async def gs_ensure_user(user: Dict[str, Any]) -> None:
 
 
 __all__ = [
-    "RATE_LIMIT_PER_DAY",
     "gs_append_request",
     "gs_update_request_status",
     "gs_find_request",
-    "guard_rate_limit_gs",
     "gs_ensure_user",
     "get_shops",
     "get_shop_name",
