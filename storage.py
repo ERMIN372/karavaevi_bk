@@ -49,6 +49,7 @@ USERS_HEADERS = [
     "id",
     "role",
     "username",
+    "phone_number",
     "first_name",
     "last_name",
     "updated_at",
@@ -300,10 +301,20 @@ def _ensure_user_sync(user: Dict[str, Any]) -> None:
     except gspread.exceptions.CellNotFound:
         cell = None
     row_index = cell.row if cell else len(_users_ws.get_all_values()) + 1
+    existing_row: Dict[str, Any] = {}
+    if cell:
+        current_values = _users_ws.row_values(row_index)
+        existing_row = {
+            header: current_values[idx] if idx < len(current_values) else ""
+            for idx, header in enumerate(USERS_HEADERS)
+        }
     payload = {
         "id": user_id,
         "role": user.get("role", "worker"),
-        "username": user.get("username") or "",
+        "username": user.get("username") or existing_row.get("username") or "",
+        "phone_number": user.get("phone_number")
+        or existing_row.get("phone_number")
+        or "",
         "first_name": user.get("first_name") or "",
         "last_name": user.get("last_name") or "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -324,11 +335,38 @@ async def gs_ensure_user(user: Dict[str, Any]) -> None:
     await asyncio.to_thread(_ensure_user_sync, user)
 
 
+def _get_user_sync(user_id: int) -> Optional[Dict[str, Any]]:
+    _ensure_initialized()
+    try:
+        cell = _users_ws.find(str(user_id))
+    except gspread.exceptions.CellNotFound:
+        return None
+    row_values = _users_ws.row_values(cell.row)
+    data: Dict[str, Any] = {}
+    for index, header in enumerate(USERS_HEADERS):
+        data[header] = row_values[index] if index < len(row_values) else ""
+    if data.get("id"):
+        try:
+            data["id"] = int(data["id"])
+        except ValueError:
+            data["id"] = user_id
+    if data.get("phone_number"):
+        data["phone_number"] = str(data["phone_number"]).strip()
+    if data.get("username"):
+        data["username"] = str(data["username"]).strip()
+    return data
+
+
+async def gs_get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(_get_user_sync, user_id)
+
+
 __all__ = [
     "gs_append_request",
     "gs_update_request_status",
     "gs_find_request",
     "gs_ensure_user",
+    "gs_get_user",
     "get_shops",
     "get_shop_name",
 ]
