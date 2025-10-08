@@ -82,6 +82,7 @@ DATE_BUTTON_PICK = "Выбрать день"
 BACK_COMMAND = "Назад"
 TIME_PROMPT_MESSAGE = "Укажи время смены в формате 09:00–18:00. Шаг — 15 минут."
 TIME_PLACEHOLDER = "например: 09:00–18:00"
+TIME_CONFIRMATION_TEMPLATE = "Время смены: {time_from}–{time_to}"
 INLINE_DATE_DAYS = 10
 
 WEEKDAY_SHORT_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -790,6 +791,10 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             )
             return
         await state.update_data(time_from=time_from, time_to=time_to)
+        await message.answer(
+            TIME_CONFIRMATION_TEMPLATE.format(time_from=time_from, time_to=time_to),
+            reply_markup=ReplyKeyboardRemove(),
+        )
         shops = await fetch_shops()
         if not shops:
             await message.answer(
@@ -902,6 +907,10 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
             )
             return
         await state.update_data(time_from=time_from, time_to=time_to)
+        await message.answer(
+            TIME_CONFIRMATION_TEMPLATE.format(time_from=time_from, time_to=time_to),
+            reply_markup=ReplyKeyboardRemove(),
+        )
         shops = await fetch_shops()
         keyboard = InlineKeyboardMarkup(row_width=2)
         for shop_id, shop_name in shops.items():
