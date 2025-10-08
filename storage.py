@@ -341,6 +341,8 @@ def _get_user_sync(user_id: int) -> Optional[Dict[str, Any]]:
         cell = _users_ws.find(str(user_id))
     except gspread.exceptions.CellNotFound:
         return None
+    if cell is None:
+        return None
     row_values = _users_ws.row_values(cell.row)
     data: Dict[str, Any] = {}
     for index, header in enumerate(USERS_HEADERS):
