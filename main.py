@@ -329,6 +329,7 @@ async def start_date_step(message: types.Message, state: FSMContext, flow: str) 
         DATE_PROMPT_MESSAGE,
         reply_markup=build_date_reply_keyboard(),
     )
+    await send_inline_date_choices(message)
 
 
 async def send_inline_date_choices(message: types.Message) -> None:
