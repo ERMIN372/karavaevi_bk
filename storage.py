@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 
@@ -223,25 +224,25 @@ def _update_request_status_sync(
         raise KeyError(f"Request {request_id} not found")
 
     updates = []
-    status_cell = f"{_column_letter(REQUESTS_COLUMNS['status'])}{cell.row}"
+    status_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["status"])
     updates.append(
         {
-            "range": f"{status_cell}:{status_cell}",
+            "range": status_cell,
             "values": [[status]],
         }
     )
-    updated_at_cell = f"{_column_letter(REQUESTS_COLUMNS['updated_at'])}{cell.row}"
+    updated_at_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["updated_at"])
     updates.append(
         {
-            "range": f"{updated_at_cell}:{updated_at_cell}",
+            "range": updated_at_cell,
             "values": [[datetime.now(timezone.utc).isoformat()]],
         }
     )
     if channel_message_id is not None:
-        channel_cell = f"{_column_letter(REQUESTS_COLUMNS['channel_message_id'])}{cell.row}"
+        channel_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["channel_message_id"])
         updates.append(
             {
-                "range": f"{channel_cell}:{channel_cell}",
+                "range": channel_cell,
                 "values": [[str(channel_message_id)]],
             }
         )
