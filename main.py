@@ -636,7 +636,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
 
         status = str(record.get("status") or "").strip().lower()
         if status != "open":
-            await call.answer("Карточка уже закрыта.", show_alert=True)
+            await call.answer("Карточка уже закрыта. Спасибо, что откликнулись", show_alert=True)
             return
 
         picker = call.from_user
