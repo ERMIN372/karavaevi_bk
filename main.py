@@ -542,7 +542,8 @@ def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) ->
     except ValueError:
         return "Дата должна быть в формате ГГГГ-ММ-ДД."
 
-    today = datetime.now(TIMEZONE).date()
+    now_local = datetime.now(TIMEZONE)
+    today = now_local.date()
     if date_obj < today:
         return "Дата не может быть в прошлом."
 
@@ -554,6 +555,9 @@ def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) ->
 
     if from_parts >= to_parts:
         return "Время начала должно быть раньше окончания."
+
+    if date_obj == today and from_parts < now_local.time():
+        return "Время начала не может быть в прошлом."
 
     for check_time in (from_parts, to_parts):
         if check_time.minute % 15 != 0:
