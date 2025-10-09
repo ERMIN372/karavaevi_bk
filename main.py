@@ -348,6 +348,22 @@ async def send_inline_date_choices(message: types.Message) -> None:
     await message.answer("Выберите дату из списка ниже:", reply_markup=markup)
 
 
+async def handle_date_pick_button(message: types.Message, state: FSMContext) -> None:
+    """Показывает список дат по запросу пользователя."""
+
+    state_name = await state.get_state()
+    flow = resolve_flow(state_name)
+
+    if not flow:
+        await message.answer(
+            "Пожалуйста, сначала выберите режим через /start.",
+            reply_markup=build_start_keyboard(),
+        )
+        return
+
+    await send_inline_date_choices(message)
+
+
 async def prompt_time_range(message: types.Message, state: FSMContext, flow: str) -> None:
     state_cls = DirectorStates if flow == "director" else WorkerStates
     await state.set_state(state_cls.time_range.state)
@@ -369,7 +385,7 @@ async def apply_date_selection(
 
 async def process_date_message(message: types.Message, state: FSMContext) -> None:
     if _matches_date_pick_button(message.text):
-        await send_inline_date_choices(message)
+        await handle_date_pick_button(message, state)
         return
     state_name = await state.get_state()
     flow = resolve_flow(state_name)
@@ -773,7 +789,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         state=DirectorStates.date,
     )
     async def director_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
-        await send_inline_date_choices(message)
+        await handle_date_pick_button(message, _)
 
     @dispatcher.message_handler(state=DirectorStates.date)
     async def director_date(message: types.Message, state: FSMContext) -> None:
@@ -889,7 +905,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         state=WorkerStates.date,
     )
     async def worker_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
-        await send_inline_date_choices(message)
+        await handle_date_pick_button(message, _)
 
     @dispatcher.message_handler(state=WorkerStates.date)
     async def worker_date(message: types.Message, state: FSMContext) -> None:
