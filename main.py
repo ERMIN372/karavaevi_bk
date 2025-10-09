@@ -944,7 +944,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
                 return
             await call.answer()
             await state.update_data(shop_id=shop_id, shop_name=shops[shop_id])
-        await call.message.edit_text("Расскажите, на какую роль готовы выйти и оставьте комментарий.")
+        await call.message.edit_text("Расскажите, на какую должность готовы выйти и оставьте комментарий.")
         await WorkerStates.note.set()
 
     @dispatcher.message_handler(state=WorkerStates.note)
