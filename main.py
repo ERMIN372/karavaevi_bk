@@ -368,6 +368,9 @@ async def apply_date_selection(
 
 
 async def process_date_message(message: types.Message, state: FSMContext) -> None:
+    if _matches_date_pick_button(message.text):
+        await send_inline_date_choices(message)
+        return
     state_name = await state.get_state()
     flow = resolve_flow(state_name)
     if not flow:
@@ -376,8 +379,10 @@ async def process_date_message(message: types.Message, state: FSMContext) -> Non
             state_name,
             message.from_user.id if message.from_user else "unknown",
         )
-        return
-    if _matches_date_pick_button(message.text):
+        await message.answer(
+            DATE_PROMPT_MESSAGE,
+            reply_markup=build_date_reply_keyboard(),
+        )
         await send_inline_date_choices(message)
         return
     today_local = datetime.now(TIMEZONE).date()
