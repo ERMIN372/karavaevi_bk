@@ -39,6 +39,12 @@ WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "5000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
+
+def now_in_timezone() -> datetime:
+    """Return the current datetime converted to the configured timezone."""
+
+    return datetime.now(timezone.utc).astimezone(TIMEZONE)
+
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN is required. Please set it in Replit Secrets.\n"
@@ -333,7 +339,7 @@ async def start_date_step(message: types.Message, state: FSMContext, flow: str) 
 
 
 async def send_inline_date_choices(message: types.Message) -> None:
-    today_local = datetime.now(TIMEZONE).date()
+    today_local = now_in_timezone().date()
     markup = build_inline_date_keyboard(today_local)
     if not markup.inline_keyboard:
         await message.answer("Нет доступных дат в заданном окне.")
@@ -375,7 +381,7 @@ async def process_date_message(message: types.Message, state: FSMContext) -> Non
         )
         await send_inline_date_choices(message)
         return
-    today_local = datetime.now(TIMEZONE).date()
+    today_local = now_in_timezone().date()
     try:
         parsed_date = parse_user_date_input(
             message.text or "",
@@ -409,7 +415,7 @@ async def process_date_callback(call: CallbackQuery, state: FSMContext, iso_valu
         )
         await call.answer("Ошибка состояния", show_alert=True)
         return
-    today_local = datetime.now(TIMEZONE).date()
+    today_local = now_in_timezone().date()
     try:
         parsed_date = parse_user_date_input(
             iso_value,
@@ -542,7 +548,7 @@ def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) ->
     except ValueError:
         return "Дата должна быть в формате ГГГГ-ММ-ДД."
 
-    now_local = datetime.now(TIMEZONE)
+    now_local = now_in_timezone()
     today = now_local.date()
     if date_obj < today:
         return "Дата не может быть в прошлом."
