@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, ContentType, ForceReply,
+from aiogram.types import (CallbackQuery, ContentType,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, ReplyKeyboardMarkup,
                            ReplyKeyboardRemove)
@@ -79,7 +79,6 @@ DATE_PARSE_ERROR_MESSAGE = "Не понял дату. Введи как 09.10 и
 DATE_CONFIRMATION_TEMPLATE = "Дата: {date_human} (ISO: {date_iso})"
 DATE_BUTTON_TODAY = "Сегодня"
 DATE_BUTTON_TOMORROW = "Завтра"
-DATE_BUTTON_PICK = "Выбрать день"
 BACK_COMMAND = "Назад"
 TIME_PROMPT_MESSAGE = "Укажи время смены в формате 09:00–18:00. Шаг — 15 минут."
 TIME_PLACEHOLDER = "например: 09:00–18:00"
@@ -147,7 +146,6 @@ def build_date_reply_keyboard() -> ReplyKeyboardMarkup:
         input_field_placeholder=DATE_PLACEHOLDER,
     )
     keyboard.row(DATE_BUTTON_TODAY, DATE_BUTTON_TOMORROW)
-    keyboard.add(DATE_BUTTON_PICK)
     return keyboard
 
 
@@ -198,12 +196,6 @@ def _normalize_text(value: str) -> str:
     text = text.replace("'", "")
     text = re.sub(r"\s+", "", text)
     return text
-
-
-def _matches_date_pick_button(text: Optional[str]) -> bool:
-    if text is None:
-        return False
-    return _normalize_text(text) == _normalize_text(DATE_BUTTON_PICK)
 
 
 def parse_user_date_input(raw_value: str, *, today: date, max_days: int) -> date:
@@ -349,24 +341,6 @@ async def send_inline_date_choices(message: types.Message) -> None:
     await message.answer("Выберите дату из списка ниже:", reply_markup=markup)
 
 
-async def handle_date_pick_button(message: types.Message, state: FSMContext) -> None:
-    """Переключает пользователя в режим ручного ввода даты."""
-    state_name = await state.get_state()
-    flow = resolve_flow(state_name)
-
-    if not flow:
-        await message.answer(
-            "Пожалуйста, сначала выберите режим через /start.",
-            reply_markup=build_start_keyboard(),
-        )
-        return
-
-    await message.answer(
-        "Введи дату вручную в формате ДД.ММ (например, 09.10).",
-        reply_markup=ForceReply(input_field_placeholder="ДД.ММ"),
-    )
-
-
 async def prompt_time_range(message: types.Message, state: FSMContext, flow: str) -> None:
     state_cls = DirectorStates if flow == "director" else WorkerStates
     await state.set_state(state_cls.time_range.state)
@@ -387,9 +361,6 @@ async def apply_date_selection(
 
 
 async def process_date_message(message: types.Message, state: FSMContext) -> None:
-    if _matches_date_pick_button(message.text):
-        await handle_date_pick_button(message, state)
-        return
     state_name = await state.get_state()
     flow = resolve_flow(state_name)
     if not flow:
@@ -787,13 +758,6 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         await state.finish()
         await start_date_step(message, state, "director")
 
-    @dispatcher.message_handler(
-        lambda m: _matches_date_pick_button(m.text),
-        state=DirectorStates.date,
-    )
-    async def director_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
-        await handle_date_pick_button(message, _)
-
     @dispatcher.message_handler(state=DirectorStates.date)
     async def director_date(message: types.Message, state: FSMContext) -> None:
         await process_date_message(message, state)
@@ -902,13 +866,6 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
             return
         await state.finish()
         await start_date_step(message, state, "worker")
-
-    @dispatcher.message_handler(
-        lambda m: _matches_date_pick_button(m.text),
-        state=WorkerStates.date,
-    )
-    async def worker_date_inline_prompt(message: types.Message, _: FSMContext) -> None:
-        await handle_date_pick_button(message, _)
 
     @dispatcher.message_handler(state=WorkerStates.date)
     async def worker_date(message: types.Message, state: FSMContext) -> None:
