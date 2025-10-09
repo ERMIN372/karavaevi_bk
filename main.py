@@ -819,7 +819,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             return
         await call.answer()
         await state.update_data(shop_id=shop_id, shop_name=shops[shop_id])
-        await call.message.edit_text("Добавьте комментарий (можно телефон). Если не нужно, напишите «Без комментариев».")
+        await call.message.edit_text("Добавьте комментарий(например: какая должность вам требуется в лавку). Если не нужно, напишите «Без комментариев».")
         await DirectorStates.note.set()
 
     @dispatcher.message_handler(state=DirectorStates.note)
