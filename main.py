@@ -9,9 +9,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardButton,
-                           InlineKeyboardMarkup, KeyboardButton,
-                           ReplyKeyboardMarkup, ReplyKeyboardRemove)
+from aiogram.types import (CallbackQuery, ContentType, ForceReply,
+                           InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, ReplyKeyboardMarkup,
+                           ReplyKeyboardRemove)
 from aiogram.utils import executor
 from dotenv import load_dotenv
 
@@ -349,8 +350,7 @@ async def send_inline_date_choices(message: types.Message) -> None:
 
 
 async def handle_date_pick_button(message: types.Message, state: FSMContext) -> None:
-    """Показывает список дат по запросу пользователя."""
-
+    """Переключает пользователя в режим ручного ввода даты."""
     state_name = await state.get_state()
     flow = resolve_flow(state_name)
 
@@ -361,7 +361,10 @@ async def handle_date_pick_button(message: types.Message, state: FSMContext) -> 
         )
         return
 
-    await send_inline_date_choices(message)
+    await message.answer(
+        "Введи дату вручную в формате ДД.ММ (например, 09.10).",
+        reply_markup=ForceReply(input_field_placeholder="ДД.ММ"),
+    )
 
 
 async def prompt_time_range(message: types.Message, state: FSMContext, flow: str) -> None:
