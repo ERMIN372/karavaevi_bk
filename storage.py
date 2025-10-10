@@ -104,6 +104,8 @@ STATIONS_CACHE: Tuple[str, ...] = ()
 SHOPS_CACHE_UPDATED_AT: Optional[datetime] = None
 _SHOPS_LOCK = RLock()
 
+UNKNOWN_DISTANCE_FALLBACK_M = 9999
+
 
 def _decode_service_account() -> Dict[str, Any]:
     if not SERVICE_ACCOUNT_B64:
@@ -254,7 +256,16 @@ def _load_shops_cache() -> None:
                 shop_name=name,
             )
             if distance is None:
-                continue
+                LOGGER.warning(
+                    "Расстояние до метро '%s' для лавки '%s' (строка %s, колонка %s) "
+                    "отсутствует или некорректно. Будет использовано значение %s м.",
+                    station,
+                    name,
+                    idx,
+                    f"dist_{suffix}_m",
+                    UNKNOWN_DISTANCE_FALLBACK_M,
+                )
+                distance = UNKNOWN_DISTANCE_FALLBACK_M
             metros.append(ShopMetro(name=station, distance_m=distance))
             metro_map.setdefault(station, {})
             current = metro_map[station].get(shop_id)
