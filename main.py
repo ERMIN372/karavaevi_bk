@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -69,6 +69,7 @@ class DirectorStates(StatesGroup):
 
 
 class WorkerStates(StatesGroup):
+    area = State()
     metro = State()
     metro_search = State()
     shop = State()
@@ -100,21 +101,21 @@ INLINE_DATE_DAYS = 10
 DIRECTOR_BUTTON_TEXT = "🧑‍💼 Директор лавки"
 WORKER_BUTTON_TEXT = "👨‍🍳 Хочу подработать"
 
-METRO_PROMPT_MESSAGE = (
-    "Выбери метро поблизости или напиши название.\n"
-    "Можно: «Проспект Мира», «ВДНХ», «Китай-город»."
-)
-METRO_SEARCH_PROMPT = (
+AREA_PROMPT_MESSAGE = "Выбери район. Потом подберём метро и лавку рядом."
+STATION_PROMPT_TEMPLATE = "Станции в «{area_name}». Выбери метро:"
+STATION_EMPTY_TEMPLATE = "В «{area_name}» сейчас нет вариантов. Выбери другой район."
+STATION_SEARCH_PROMPT = (
     "Напиши название станции метро.\n"
     "Можно: «Проспект Мира», «ВДНХ», «Китай-город»."
 )
-METRO_NO_SHOPS_TEMPLATE = "Рядом с «{station}» лавок не нашли. Попробуй другую станцию."
-METRO_SHOPS_TITLE_TEMPLATE = "Лавки у «{station}». Выбери место:"
+STATION_SEARCH_RESULTS_TEMPLATE = "Результаты поиска по «{query}». Выбери метро:"
+SHOP_EMPTY_TEMPLATE = "Рядом со станцией «{station}» сейчас пусто. Выбери другую станцию."
+SHOP_LIST_TITLE_TEMPLATE = "Лавки у «{station}». Выбери место:"
 
-METRO_SEARCH_BUTTON_TEXT = "🔎 Поиск по названию"
-METRO_BACK_BUTTON_TEXT = "⬅️ Назад"
-METRO_ALL_BUTTON_TEXT = "📋 Все станции"
-SHOP_BACK_BUTTON_TEXT = "⬅️ К метро"
+STATION_SEARCH_BUTTON_TEXT = "🔎 Поиск по названию"
+STATION_BACK_BUTTON_TEXT = "⬅️ Районы"
+STATION_RESET_BUTTON_TEXT = "📋 Список станций"
+SHOP_BACK_BUTTON_TEXT = "⬅️ Станции"
 SHOP_RESET_BUTTON_TEXT = "🔁 Сбросить выбор"
 
 STATIONS_PER_PAGE = 10
@@ -329,25 +330,35 @@ def _compute_page_bounds(length: int, page: int, per_page: int) -> Tuple[int, in
     return page, start, end, total_pages
 
 
-def build_metro_keyboard(
-    stations: List[str], page: int, mode: str
+def build_area_keyboard(areas: List[storage.AreaSummary]) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    for area in areas:
+        emoji = f"{area.emoji} " if area.emoji else ""
+        button_text = f"{emoji}{area.title} ({area.shop_count})"
+        markup.add(InlineKeyboardButton(button_text, callback_data=f"warea:{area.area_id}"))
+    return markup
+
+
+def build_station_keyboard(
+    stations: List[storage.StationSummary], page: int, *, show_reset: bool
 ) -> Tuple[InlineKeyboardMarkup, int, int]:
     page, start, end, total_pages = _compute_page_bounds(len(stations), page, STATIONS_PER_PAGE)
     markup = InlineKeyboardMarkup(row_width=1)
     for index in range(start, end):
         station = stations[index]
-        markup.add(InlineKeyboardButton(station, callback_data=f"wm_pick:{index}"))
+        button_text = f"{station.name} (лавок: {station.shop_count})"
+        markup.add(InlineKeyboardButton(button_text, callback_data=f"wstation_pick:{index}"))
     nav_buttons: List[InlineKeyboardButton] = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"wm_page:{page - 1}"))
+        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"wstation_page:{page - 1}"))
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"wm_page:{page + 1}"))
+        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"wstation_page:{page + 1}"))
     if nav_buttons:
         markup.row(*nav_buttons)
-    markup.row(InlineKeyboardButton(METRO_SEARCH_BUTTON_TEXT, callback_data="wm_search"))
-    if mode == "search":
-        markup.row(InlineKeyboardButton(METRO_ALL_BUTTON_TEXT, callback_data="wm_all"))
-    markup.row(InlineKeyboardButton(METRO_BACK_BUTTON_TEXT, callback_data="wm_back"))
+    markup.row(InlineKeyboardButton(STATION_SEARCH_BUTTON_TEXT, callback_data="wstation_search"))
+    if show_reset:
+        markup.row(InlineKeyboardButton(STATION_RESET_BUTTON_TEXT, callback_data="wstation_reset"))
+    markup.row(InlineKeyboardButton(STATION_BACK_BUTTON_TEXT, callback_data="wstation_back_area"))
     return markup, page, total_pages
 
 
@@ -1010,34 +1021,63 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
 
 
 def run_worker_flow(dispatcher: Dispatcher) -> None:
-    async def set_metro_context(
+    async def present_area_menu(
+        target_message: types.Message, state: FSMContext, *, via_edit: bool
+    ) -> None:
+        areas = [area for area in storage.get_area_summaries() if area.shop_count > 0]
+        if not areas:
+            await state.finish()
+            text = "Список районов пуст. Обратитесь к администратору."
+            markup = build_start_keyboard()
+            if via_edit:
+                try:
+                    await target_message.edit_text(text, reply_markup=markup)
+                    return
+                except Exception:  # noqa: BLE001
+                    logging.debug("Не удалось обновить сообщение с районами, отправляем новое")
+            await target_message.answer(text, reply_markup=markup)
+            return
+        markup = build_area_keyboard(list(areas))
+        if via_edit:
+            try:
+                await target_message.edit_text(AREA_PROMPT_MESSAGE, reply_markup=markup)
+                return
+            except Exception:  # noqa: BLE001
+                logging.debug("Не удалось обновить список районов, отправляем новое сообщение")
+        await target_message.answer(AREA_PROMPT_MESSAGE, reply_markup=markup)
+
+    async def set_station_context(
         state: FSMContext,
+        area_summary: storage.AreaSummary,
         *,
-        mode: str,
-        stations: List[str],
+        mode: str = "list",
+        stations: Optional[Iterable[storage.StationSummary]] = None,
         page: int = 0,
         query: str = "",
     ) -> Dict[str, Any]:
         context = {
+            "area_id": area_summary.area_id,
+            "area_name": area_summary.area_name,
+            "area_title": area_summary.title,
             "mode": mode,
-            "stations": list(stations),
+            "stations": list(stations if stations is not None else area_summary.stations),
             "page": page,
             "query": query,
         }
-        await state.update_data(worker_metro=context)
+        await state.update_data(worker_station=context)
         return context
 
-    async def get_metro_context(state: FSMContext) -> Dict[str, Any]:
+    async def get_station_context(state: FSMContext) -> Dict[str, Any]:
         data = await state.get_data()
-        context = data.get("worker_metro")
-        if context and isinstance(context.get("stations"), list) and context["stations"]:
-            return context
-        stations = list(storage.get_station_names())
-        if not stations:
+        context = data.get("worker_station")
+        if not isinstance(context, dict):
             return {}
-        return await set_metro_context(state, mode="list", stations=stations, page=0)
+        stations = context.get("stations")
+        if isinstance(stations, tuple):
+            context["stations"] = list(stations)
+        return context
 
-    async def present_metro_menu(
+    async def present_station_menu(
         target_message: types.Message,
         state: FSMContext,
         context: Dict[str, Any],
@@ -1045,28 +1085,34 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         via_edit: bool,
     ) -> None:
         stations = context.get("stations") or []
+        area_name = context.get("area_name") or context.get("area_title") or ""
         if not stations:
-            await state.finish()
-            await target_message.answer(
-                "Список станций пуст. Обратитесь к администратору.",
-                reply_markup=build_start_keyboard(),
-            )
+            text = STATION_EMPTY_TEMPLATE.format(area_name=area_name or "выбранном районе")
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton(STATION_BACK_BUTTON_TEXT, callback_data="wstation_back_area"))
+            if via_edit:
+                try:
+                    await target_message.edit_text(text, reply_markup=markup)
+                    return
+                except Exception:  # noqa: BLE001
+                    logging.debug("Не удалось показать сообщение об отсутствии станций")
+            await target_message.answer(text, reply_markup=markup)
             return
-        markup, actual_page, _ = build_metro_keyboard(
-            stations, context.get("page", 0), context.get("mode", "list")
+        markup, actual_page, _ = build_station_keyboard(
+            stations, context.get("page", 0), show_reset=context.get("mode") == "search"
         )
         context["page"] = actual_page
-        await state.update_data(worker_metro=context)
+        await state.update_data(worker_station=context)
         if context.get("mode") == "search" and context.get("query"):
-            text = f"Результаты поиска по «{context['query']}».\n{METRO_PROMPT_MESSAGE}"
+            text = STATION_SEARCH_RESULTS_TEMPLATE.format(query=context["query"])
         else:
-            text = METRO_PROMPT_MESSAGE
+            text = STATION_PROMPT_TEMPLATE.format(area_name=area_name)
         if via_edit:
             try:
                 await target_message.edit_text(text, reply_markup=markup)
                 return
             except Exception:  # noqa: BLE001
-                logging.debug("Не удалось обновить список метро, отправляем новое сообщение")
+                logging.debug("Не удалось обновить список станций, отправляем новое сообщение")
         await target_message.answer(text, reply_markup=markup)
 
     async def set_shop_context(
@@ -1094,22 +1140,14 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
     ) -> None:
         shops_list = context.get("shops") or []
         station = context.get("station", "")
-        if not shops_list:
-            markup = InlineKeyboardMarkup(row_width=1)
-            markup.add(InlineKeyboardButton(SHOP_BACK_BUTTON_TEXT, callback_data="wshop_back"))
-            text = METRO_NO_SHOPS_TEMPLATE.format(station=station) if station else METRO_PROMPT_MESSAGE
-            if via_edit:
-                try:
-                    await target_message.edit_text(text, reply_markup=markup)
-                    return
-                except Exception:  # noqa: BLE001
-                    logging.debug("Не удалось показать сообщение о пустом списке лавок")
-            await target_message.answer(text, reply_markup=markup)
-            return
         markup, actual_page, _ = build_shop_keyboard(shops_list, context.get("page", 0))
         context["page"] = actual_page
         await state.update_data(worker_shop=context)
-        text = METRO_SHOPS_TITLE_TEMPLATE.format(station=station)
+        text = (
+            SHOP_LIST_TITLE_TEMPLATE.format(station=station)
+            if shops_list
+            else SHOP_EMPTY_TEMPLATE.format(station=station)
+        )
         if via_edit:
             try:
                 await target_message.edit_text(text, reply_markup=markup)
@@ -1123,105 +1161,128 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         if not await ensure_contact_exists(message):
             return
         await state.finish()
-        stations = list(storage.get_station_names())
-        if not stations:
-            await message.answer(
-                "Список станций пуст. Обратитесь к администратору.",
-                reply_markup=build_start_keyboard(),
-            )
-            return
-        await state.set_state(WorkerStates.metro.state)
-        context = await set_metro_context(state, mode="list", stations=stations, page=0)
-        await present_metro_menu(message, state, context, via_edit=False)
+        await state.set_state(WorkerStates.area.state)
+        await present_area_menu(message, state, via_edit=False)
 
     @dispatcher.callback_query_handler(
-        lambda c: c.data and c.data.startswith("wm_"),
+        lambda c: c.data and c.data.startswith("warea:"),
+        state=[WorkerStates.area, WorkerStates.metro, WorkerStates.shop],
+    )
+    async def worker_area_choice(call: CallbackQuery, state: FSMContext) -> None:
+        try:
+            _, area_id = (call.data or "").split(":", 1)
+        except ValueError:
+            await call.answer("Район недоступен", show_alert=True)
+            return
+        summary = storage.get_area_summary(area_id)
+        if summary is None:
+            await call.answer("Район недоступен", show_alert=True)
+            await state.set_state(WorkerStates.area.state)
+            await present_area_menu(call.message, state, via_edit=True)
+            return
+        await call.answer()
+        await state.set_state(WorkerStates.metro.state)
+        await state.update_data(
+            shop_id=None,
+            shop_name=None,
+            chosen_metro=None,
+            chosen_metro_dist_m=None,
+        )
+        context = await set_station_context(state, summary, mode="list", page=0)
+        await present_station_menu(call.message, state, context, via_edit=True)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data and c.data.startswith("wstation_page:"),
+        state=WorkerStates.metro,
+    )
+    async def worker_station_page(call: CallbackQuery, state: FSMContext) -> None:
+        context = await get_station_context(state)
+        stations = context.get("stations") or []
+        if not stations:
+            await call.answer("Станции недоступны", show_alert=True)
+            return
+        try:
+            requested_page = int((call.data or "").split(":", 1)[1])
+        except (ValueError, IndexError):
+            await call.answer("Некорректная страница", show_alert=True)
+            return
+        context["page"] = requested_page
+        await state.update_data(worker_station=context)
+        await call.answer()
+        await present_station_menu(call.message, state, context, via_edit=True)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data and c.data.startswith("wstation_pick:"),
+        state=WorkerStates.metro,
+    )
+    async def worker_station_pick(call: CallbackQuery, state: FSMContext) -> None:
+        context = await get_station_context(state)
+        stations = context.get("stations") or []
+        try:
+            index = int((call.data or "").split(":", 1)[1])
+        except (ValueError, IndexError):
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        if index < 0 or index >= len(stations):
+            await call.answer("Станция не найдена", show_alert=True)
+            return
+        summary = stations[index]
+        await call.answer()
+        locations = storage.get_station_shops(summary.name)
+        shops = [
+            {"id": location.shop_id, "name": location.shop_name, "distance": location.distance_m}
+            for location in locations
+        ]
+        await state.update_data(chosen_metro=summary.name, chosen_metro_dist_m=None)
+        shop_context = await set_shop_context(state, summary.name, shops, page=0)
+        await state.set_state(WorkerStates.shop.state)
+        await present_shop_menu(call.message, state, shop_context, via_edit=True)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data == "wstation_search",
+        state=WorkerStates.metro,
+    )
+    async def worker_station_search(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        await state.set_state(WorkerStates.metro_search.state)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton(STATION_RESET_BUTTON_TEXT, callback_data="wstation_reset"))
+        markup.add(InlineKeyboardButton(STATION_BACK_BUTTON_TEXT, callback_data="wstation_back_area"))
+        try:
+            await call.message.edit_text(STATION_SEARCH_PROMPT, reply_markup=markup)
+        except Exception:  # noqa: BLE001
+            await call.message.answer(STATION_SEARCH_PROMPT, reply_markup=markup)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data == "wstation_reset",
         state=[WorkerStates.metro, WorkerStates.metro_search],
     )
-    async def worker_metro_callbacks(call: CallbackQuery, state: FSMContext) -> None:
-        data = call.data or ""
-        if data.startswith("wm_pick:"):
-            context = await get_metro_context(state)
-            stations = context.get("stations") or []
-            try:
-                index = int(data.split(":", 1)[1])
-            except ValueError:
-                await call.answer("Некорректный выбор", show_alert=True)
-                return
-            if index < 0 or index >= len(stations):
-                await call.answer("Станция не найдена", show_alert=True)
-                return
-            station = stations[index]
-            logging.info("Пользователь %s выбрал метро «%s»", call.from_user.id, station)
-            await call.answer()
-            locations = storage.get_station_shops(station)
-            if not locations:
-                await state.set_state(WorkerStates.metro.state)
-                context["page"] = context.get("page", 0)
-                await state.update_data(worker_metro=context)
-                empty_context = {"station": station, "shops": [], "page": 0}
-                await present_shop_menu(call.message, state, empty_context, via_edit=True)
-                return
-            shops = [
-                {"id": location.shop_id, "name": location.shop_name, "distance": location.distance_m}
-                for location in locations
-            ]
-            await set_shop_context(state, station, shops, page=0)
-            await state.update_data(chosen_metro=station, chosen_metro_dist_m=None)
-            await state.set_state(WorkerStates.shop.state)
-            await present_shop_menu(call.message, state, await get_shop_context(state), via_edit=True)
+    async def worker_station_reset(call: CallbackQuery, state: FSMContext) -> None:
+        context = await get_station_context(state)
+        area_id = context.get("area_id")
+        if not area_id:
+            await call.answer("Сначала выбери район", show_alert=True)
             return
-        if data.startswith("wm_page:"):
-            context = await get_metro_context(state)
-            if not context:
-                await call.answer("Станции недоступны", show_alert=True)
-                return
-            try:
-                requested_page = int(data.split(":", 1)[1])
-            except ValueError:
-                await call.answer("Некорректная страница", show_alert=True)
-                return
-            context["page"] = requested_page
-            await state.update_data(worker_metro=context)
-            await call.answer()
-            await present_metro_menu(call.message, state, context, via_edit=True)
+        summary = storage.get_area_summary(area_id)
+        if summary is None:
+            await call.answer("Район недоступен", show_alert=True)
+            await state.set_state(WorkerStates.area.state)
+            await present_area_menu(call.message, state, via_edit=True)
             return
-        if data == "wm_search":
-            await call.answer()
-            await state.set_state(WorkerStates.metro_search.state)
-            markup = InlineKeyboardMarkup(row_width=1)
-            markup.add(InlineKeyboardButton(METRO_ALL_BUTTON_TEXT, callback_data="wm_all"))
-            markup.add(InlineKeyboardButton(METRO_BACK_BUTTON_TEXT, callback_data="wm_back"))
-            try:
-                await call.message.edit_text(METRO_SEARCH_PROMPT, reply_markup=markup)
-            except Exception:  # noqa: BLE001
-                await call.message.answer(METRO_SEARCH_PROMPT, reply_markup=markup)
-            return
-        if data == "wm_all":
-            await call.answer()
-            stations = list(storage.get_station_names())
-            if not stations:
-                await state.finish()
-                await call.message.edit_text(
-                    "Список станций пуст. Обратитесь к администратору.",
-                    reply_markup=None,
-                )
-                await start_menu(call.message)
-                return
-            await state.set_state(WorkerStates.metro.state)
-            context = await set_metro_context(state, mode="list", stations=stations, page=0)
-            await present_metro_menu(call.message, state, context, via_edit=True)
-            return
-        if data == "wm_back":
-            await call.answer()
-            await state.finish()
-            try:
-                await call.message.edit_reply_markup()
-            except Exception:  # noqa: BLE001
-                pass
-            await start_menu(call.message)
-            return
-        await call.answer("Действие недоступно", show_alert=True)
+        await state.set_state(WorkerStates.metro.state)
+        await call.answer()
+        context = await set_station_context(state, summary, mode="list", page=0)
+        await present_station_menu(call.message, state, context, via_edit=True)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data == "wstation_back_area",
+        state=[WorkerStates.area, WorkerStates.metro, WorkerStates.metro_search, WorkerStates.shop],
+    )
+    async def worker_station_back_area(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        await state.set_state(WorkerStates.area.state)
+        await state.set_data({})
+        await present_area_menu(call.message, state, via_edit=True)
 
     @dispatcher.message_handler(state=WorkerStates.metro_search)
     async def worker_metro_search_input(message: types.Message, state: FSMContext) -> None:
@@ -1229,32 +1290,44 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         if not query:
             await message.answer("Введи название станции метро.")
             return
-        stations_all = list(storage.get_station_names())
-        if not stations_all:
-            await message.answer(
-                "Список станций пуст. Обратитесь к администратору.",
-                reply_markup=build_start_keyboard(),
-            )
-            await state.finish()
+        if query.lower() == BACK_COMMAND.lower():
+            await state.set_state(WorkerStates.metro.state)
+            context = await get_station_context(state)
+            if not context:
+                await state.set_state(WorkerStates.area.state)
+                await present_area_menu(message, state, via_edit=False)
+                return
+            await present_station_menu(message, state, context, via_edit=False)
             return
-        normalized_query = _normalize_station_search_text(query)
-        if not normalized_query:
-            await message.answer("Введи название станции метро.")
+        context = await get_station_context(state)
+        area_id = context.get("area_id")
+        if not area_id:
+            await message.answer("Сначала выбери район.")
+            await state.set_state(WorkerStates.area.state)
+            await present_area_menu(message, state, via_edit=False)
             return
-        matches: List[str] = []
-        for station in stations_all:
-            if normalized_query in _normalize_station_search_text(station):
-                matches.append(station)
-                if len(matches) >= MAX_SEARCH_RESULTS:
-                    break
-        if not matches:
+        results = storage.search_stations(query, limit=MAX_SEARCH_RESULTS)
+        if not results:
             await message.answer(
                 f"Станций по запросу «{query}» не нашли. Попробуй другое название."
             )
             return
+        summary = storage.get_area_summary(area_id)
+        if summary is None:
+            await message.answer("Район недоступен, выбери заново.")
+            await state.set_state(WorkerStates.area.state)
+            await present_area_menu(message, state, via_edit=False)
+            return
         await state.set_state(WorkerStates.metro.state)
-        context = await set_metro_context(state, mode="search", stations=matches, page=0, query=query)
-        await present_metro_menu(message, state, context, via_edit=False)
+        context = await set_station_context(
+            state,
+            summary,
+            mode="search",
+            stations=results,
+            page=0,
+            query=query,
+        )
+        await present_station_menu(message, state, context, via_edit=False)
 
     @dispatcher.callback_query_handler(
         lambda c: c.data and c.data.startswith("wshop_page:"),
@@ -1266,8 +1339,8 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
             await call.answer("Список лавок недоступен", show_alert=True)
             return
         try:
-            requested_page = int(call.data.split(":", 1)[1])
-        except ValueError:
+            requested_page = int((call.data or "").split(":", 1)[1])
+        except (ValueError, IndexError):
             await call.answer("Некорректная страница", show_alert=True)
             return
         context["page"] = requested_page
@@ -1284,8 +1357,8 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         shops_list = context.get("shops") or []
         station = context.get("station") or ""
         try:
-            index = int(call.data.split(":", 1)[1])
-        except ValueError:
+            index = int((call.data or "").split(":", 1)[1])
+        except (ValueError, IndexError):
             await call.answer("Некорректная лавка", show_alert=True)
             return
         if index < 0 or index >= len(shops_list):
@@ -1322,19 +1395,12 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
     async def worker_shop_back(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         await state.set_state(WorkerStates.metro.state)
-        context = await get_metro_context(state)
+        context = await get_station_context(state)
         if not context:
-            stations = list(storage.get_station_names())
-            if not stations:
-                await state.finish()
-                await call.message.edit_text(
-                    "Список станций пуст. Обратитесь к администратору.",
-                    reply_markup=None,
-                )
-                await start_menu(call.message)
-                return
-            context = await set_metro_context(state, mode="list", stations=stations, page=0)
-        await present_metro_menu(call.message, state, context, via_edit=True)
+            await state.set_state(WorkerStates.area.state)
+            await present_area_menu(call.message, state, via_edit=True)
+            return
+        await present_station_menu(call.message, state, context, via_edit=True)
 
     @dispatcher.callback_query_handler(
         lambda c: c.data == "wshop_reset",
@@ -1342,12 +1408,9 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
     )
     async def worker_shop_reset(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
-        await state.finish()
-        try:
-            await call.message.edit_reply_markup()
-        except Exception:  # noqa: BLE001
-            pass
-        await start_menu(call.message)
+        await state.set_state(WorkerStates.area.state)
+        await state.set_data({})
+        await present_area_menu(call.message, state, via_edit=True)
 
     @dispatcher.message_handler(state=WorkerStates.date)
     async def worker_date(message: types.Message, state: FSMContext) -> None:

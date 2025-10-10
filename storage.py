@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from collections import defaultdict
+
 import gspread
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
@@ -30,6 +32,7 @@ SCOPES = [
 REQUESTS_SHEET = "Requests"
 USERS_SHEET = "Users"
 SHOPS_SHEET = "Shops"
+METRO_AREAS_SHEET = "MetroAreas"
 
 REQUESTS_HEADERS = [
     "id",
@@ -71,6 +74,12 @@ SHOPS_HEADERS = [
     "dist_3_m",
 ]
 
+METRO_AREAS_HEADERS = [
+    "station",
+    "area_id",
+    "area_name",
+]
+
 
 @dataclass(frozen=True)
 class ShopMetro:
@@ -93,16 +102,78 @@ class ShopLocation:
     distance_m: int
 
 
+@dataclass(frozen=True)
+class StationSummary:
+    name: str
+    area_id: str
+    area_name: str
+    shop_count: int
+
+
+@dataclass(frozen=True)
+class AreaSummary:
+    area_id: str
+    area_name: str
+    emoji: str
+    title: str
+    shop_count: int
+    stations: Tuple[StationSummary, ...]
+
+
 _client = None
 _spreadsheet = None
 _requests_ws = None
 _users_ws = None
 _shops_ws = None
+_metro_areas_ws = None
 SHOPS_CACHE: Dict[int, ShopRecord] = {}
 METRO_CACHE: Dict[str, Tuple[ShopLocation, ...]] = {}
 STATIONS_CACHE: Tuple[str, ...] = ()
+STATION_SUMMARY_CACHE: Tuple[StationSummary, ...] = ()
+STATION_SUMMARY_BY_NAME: Dict[str, StationSummary] = {}
+STATION_SEARCH_INDEX: Tuple[Tuple[str, StationSummary], ...] = ()
+AREA_SUMMARY_CACHE: Dict[str, AreaSummary] = {}
+AREA_SUMMARY_LIST: Tuple[AreaSummary, ...] = ()
 SHOPS_CACHE_UPDATED_AT: Optional[datetime] = None
 _SHOPS_LOCK = RLock()
+
+CACHE_TTL_SECONDS = 15 * 60
+
+DEFAULT_AREA_ID = "CENTER"
+DEFAULT_AREA_NAME = "Центр"
+
+AREA_PRESETS: Dict[str, Dict[str, str]] = {
+    "CENTER": {"emoji": "🏛️", "title": "Центр (ЦАО)", "fallback_name": "Центр"},
+    "NORTH": {"emoji": "⬆️", "title": "Север (САО)", "fallback_name": "Север"},
+    "NORTH_EAST": {"emoji": "↗️", "title": "Северо-Восток (СВАО)", "fallback_name": "Северо-Восток"},
+    "EAST": {"emoji": "➡️", "title": "Восток (ВАО)", "fallback_name": "Восток"},
+    "SOUTH_EAST": {"emoji": "↘️", "title": "Юго-Восток (ЮВАО)", "fallback_name": "Юго-Восток"},
+    "SOUTH": {"emoji": "⬇️", "title": "Юг (ЮАО)", "fallback_name": "Юг"},
+    "SOUTH_WEST": {"emoji": "↙️", "title": "Юго-Запад (ЮЗАО)", "fallback_name": "Юго-Запад"},
+    "WEST": {"emoji": "⬅️", "title": "Запад (ЗАО)", "fallback_name": "Запад"},
+    "NORTH_WEST": {"emoji": "↖️", "title": "Северо-Запад (СЗАО)", "fallback_name": "Северо-Запад"},
+    "TINAO": {"emoji": "🏡", "title": "ТиНАО", "fallback_name": "ТиНАО"},
+    "MO": {"emoji": "🚆", "title": "МО/Пригород", "fallback_name": "МО/Пригород"},
+    "MOSCOW_REGION": {"emoji": "🚆", "title": "МО/Пригород", "fallback_name": "МО/Пригород"},
+}
+
+AREA_CANONICAL: Dict[str, str] = {
+    "MOSCOW_REGION": "MO",
+}
+
+AREA_ORDER: Tuple[str, ...] = (
+    "CENTER",
+    "NORTH",
+    "NORTH_EAST",
+    "EAST",
+    "SOUTH_EAST",
+    "SOUTH",
+    "SOUTH_WEST",
+    "WEST",
+    "NORTH_WEST",
+    "TINAO",
+    "MO",
+)
 
 UNKNOWN_DISTANCE_FALLBACK_M = 9999
 
@@ -118,7 +189,7 @@ def _decode_service_account() -> Dict[str, Any]:
 
 
 def _ensure_initialized() -> None:
-    global _client, _spreadsheet, _requests_ws, _users_ws, _shops_ws
+    global _client, _spreadsheet, _requests_ws, _users_ws, _shops_ws, _metro_areas_ws
 
     if _client is not None:
         return
@@ -140,7 +211,14 @@ def _ensure_initialized() -> None:
     _shops_ws = _get_or_create_worksheet(SHOPS_SHEET)
     _ensure_headers(_shops_ws, SHOPS_HEADERS)
 
-    _load_shops_cache()
+    try:
+        _metro_areas_ws = _get_or_create_worksheet(METRO_AREAS_SHEET)
+        _ensure_headers(_metro_areas_ws, METRO_AREAS_HEADERS)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Не удалось получить лист MetroAreas: %s", exc)
+        _metro_areas_ws = None
+
+    _load_reference_cache()
 
 
 def _get_or_create_worksheet(title: str) -> gspread.Worksheet:
@@ -217,15 +295,96 @@ def _parse_distance(value: Any, *, row_number: int, column: str, shop_name: str)
     return distance
 
 
-def _load_shops_cache() -> None:
-    global SHOPS_CACHE, METRO_CACHE, STATIONS_CACHE, SHOPS_CACHE_UPDATED_AT
+def _canonical_area_id(area_id: str) -> str:
+    if not area_id:
+        return DEFAULT_AREA_ID
+    return AREA_CANONICAL.get(area_id.upper(), area_id.upper())
+
+
+def _get_area_preset(area_id: str) -> Dict[str, str]:
+    return AREA_PRESETS.get(_canonical_area_id(area_id), {})
+
+
+def _get_area_display_name(area_id: str, area_name: Optional[str]) -> str:
+    text = (area_name or "").strip()
+    if text:
+        return text
+    preset = _get_area_preset(area_id)
+    return preset.get("fallback_name") or DEFAULT_AREA_NAME
+
+
+def _normalize_station_for_search(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = text.replace("ё", "е")
+    for char in ("-", "–", "—", "_", " "):
+        text = text.replace(char, "")
+    text = text.replace("(", "").replace(")", "")
+    text = text.replace("«", "").replace("»", "")
+    return text
+
+
+def _load_metro_areas_map() -> Dict[str, Tuple[str, str]]:
+    if _metro_areas_ws is None:
+        return {}
+    try:
+        records = _metro_areas_ws.get_all_records(expected_headers=METRO_AREAS_HEADERS)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Не удалось загрузить лист MetroAreas: %s", exc)
+        return {}
+    mapping: Dict[str, Tuple[str, str]] = {}
+    for row in records:
+        station = (row.get("station") or "").strip()
+        if not station:
+            continue
+        raw_area_id = (row.get("area_id") or "").strip().upper()
+        area_id = raw_area_id or DEFAULT_AREA_ID
+        area_name = _get_area_display_name(area_id, (row.get("area_name") or "").strip())
+        mapping[station] = (area_id, area_name)
+    return mapping
+
+
+def _resolve_station_area(
+    station: str,
+    area_mapping: Dict[str, Tuple[str, str]],
+) -> Tuple[str, str]:
+    area_id, area_name = area_mapping.get(station, (DEFAULT_AREA_ID, DEFAULT_AREA_NAME))
+    return area_id, _get_area_display_name(area_id, area_name)
+
+
+def _area_sort_key(area_id: str, title: str) -> Tuple[int, str]:
+    canonical = _canonical_area_id(area_id)
+    try:
+        order_index = AREA_ORDER.index(canonical)
+    except ValueError:
+        order_index = len(AREA_ORDER)
+    return order_index, title.lower()
+
+
+def _load_reference_cache() -> None:
+    global SHOPS_CACHE
+    global METRO_CACHE
+    global STATIONS_CACHE
+    global STATION_SUMMARY_CACHE
+    global STATION_SUMMARY_BY_NAME
+    global STATION_SEARCH_INDEX
+    global AREA_SUMMARY_CACHE
+    global AREA_SUMMARY_LIST
+    global SHOPS_CACHE_UPDATED_AT
 
     if _shops_ws is None:
         raise RuntimeError("Shops worksheet not initialized")
 
-    values = _shops_ws.get_all_records(expected_headers=SHOPS_HEADERS)
+    area_mapping = _load_metro_areas_map()
+
+    try:
+        values = _shops_ws.get_all_records(expected_headers=SHOPS_HEADERS)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Не удалось загрузить лист Shops: %s", exc)
+        return
+
     shops: Dict[int, ShopRecord] = {}
     metro_map: Dict[str, Dict[int, int]] = {}
+    station_area_map: Dict[str, Tuple[str, str]] = {}
 
     for idx, row in enumerate(values, start=2):
         raw_id = row.get("id")
@@ -249,6 +408,8 @@ def _load_shops_cache() -> None:
             distance_value = row.get(f"dist_{suffix}_m")
             if not station:
                 continue
+            area_id, area_name = _resolve_station_area(station, area_mapping)
+            station_area_map[station] = (area_id, area_name)
             distance = _parse_distance(
                 distance_value,
                 row_number=idx,
@@ -279,6 +440,12 @@ def _load_shops_cache() -> None:
         LOGGER.warning("Shops sheet is empty – no options will be available")
 
     metro_cache: Dict[str, Tuple[ShopLocation, ...]] = {}
+    area_station_map: Dict[str, List[StationSummary]] = defaultdict(list)
+    area_shop_sets: Dict[str, set[int]] = defaultdict(set)
+    station_summaries: List[StationSummary] = []
+    search_index: List[Tuple[str, StationSummary]] = []
+    area_names: Dict[str, str] = {}
+
     for station, per_shop in metro_map.items():
         locations = [
             ShopLocation(shop_id=s_id, shop_name=shops[s_id].name, distance_m=dist)
@@ -290,19 +457,79 @@ def _load_shops_cache() -> None:
         locations.sort(key=lambda item: (item.distance_m, item.shop_name.lower()))
         metro_cache[station] = tuple(locations)
 
-    stations = tuple(sorted(metro_cache.keys(), key=lambda value: value.lower()))
+        area_id, area_name = _resolve_station_area(station, station_area_map)
+        area_names.setdefault(area_id, area_name)
+
+        summary = StationSummary(
+            name=station,
+            area_id=area_id,
+            area_name=area_name,
+            shop_count=len(locations),
+        )
+        station_summaries.append(summary)
+        area_station_map[area_id].append(summary)
+        area_shop_sets[area_id].update(location.shop_id for location in locations)
+        search_index.append((_normalize_station_for_search(station), summary))
+
+    stations = tuple(sorted(station.name for station in station_summaries))
+
+    area_summaries: Dict[str, AreaSummary] = {}
+    area_list: List[AreaSummary] = []
+    for area_id, items in area_station_map.items():
+        if not items:
+            continue
+        items.sort(key=lambda entry: (-entry.shop_count, entry.name.lower()))
+        preset = _get_area_preset(area_id)
+        emoji = preset.get("emoji", "")
+        title = preset.get("title") or area_names.get(area_id) or area_id
+        area_name = area_names.get(area_id) or preset.get("fallback_name") or area_id
+        shop_ids = area_shop_sets.get(area_id, set())
+        area_summary = AreaSummary(
+            area_id=area_id,
+            area_name=area_name,
+            emoji=emoji,
+            title=title,
+            shop_count=len(shop_ids),
+            stations=tuple(items),
+        )
+        area_summaries[area_id] = area_summary
+        area_list.append(area_summary)
+
+    area_list.sort(key=lambda summary: _area_sort_key(summary.area_id, summary.title))
+    station_summaries.sort(key=lambda entry: entry.name.lower())
+    search_index.sort(key=lambda pair: pair[0])
 
     with _SHOPS_LOCK:
         SHOPS_CACHE = shops
         METRO_CACHE = metro_cache
         STATIONS_CACHE = stations
+        STATION_SUMMARY_CACHE = tuple(station_summaries)
+        STATION_SUMMARY_BY_NAME = {summary.name: summary for summary in station_summaries}
+        STATION_SEARCH_INDEX = tuple(search_index)
+        AREA_SUMMARY_CACHE = area_summaries
+        AREA_SUMMARY_LIST = tuple(area_list)
         SHOPS_CACHE_UPDATED_AT = datetime.now(timezone.utc)
+
+
+def _should_refresh_cache() -> bool:
+    with _SHOPS_LOCK:
+        updated_at = SHOPS_CACHE_UPDATED_AT
+    if updated_at is None:
+        return True
+    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    return age > CACHE_TTL_SECONDS
+
+
+def _ensure_cache_fresh() -> None:
+    if _should_refresh_cache():
+        _refresh_shops_cache_sync()
 
 
 def get_shops() -> Dict[int, ShopRecord]:
     """Return cached shops mapping."""
 
     _ensure_initialized()
+    _ensure_cache_fresh()
     with _SHOPS_LOCK:
         return {
             shop_id: record
@@ -315,6 +542,7 @@ def get_shop_name(shop_id: Optional[int]) -> Optional[str]:
     if shop_id is None:
         return None
     _ensure_initialized()
+    _ensure_cache_fresh()
     with _SHOPS_LOCK:
         record = SHOPS_CACHE.get(shop_id)
         return record.name if record else None
@@ -322,12 +550,14 @@ def get_shop_name(shop_id: Optional[int]) -> Optional[str]:
 
 def get_station_names() -> Tuple[str, ...]:
     _ensure_initialized()
+    _ensure_cache_fresh()
     with _SHOPS_LOCK:
         return STATIONS_CACHE
 
 
 def get_station_shops(station: str) -> Tuple[ShopLocation, ...]:
     _ensure_initialized()
+    _ensure_cache_fresh()
     with _SHOPS_LOCK:
         return METRO_CACHE.get(station, tuple())
 
@@ -338,9 +568,49 @@ def get_shops_updated_at() -> Optional[datetime]:
         return SHOPS_CACHE_UPDATED_AT
 
 
+def get_area_summaries() -> Tuple[AreaSummary, ...]:
+    _ensure_initialized()
+    _ensure_cache_fresh()
+    with _SHOPS_LOCK:
+        return AREA_SUMMARY_LIST
+
+
+def get_area_summary(area_id: str) -> Optional[AreaSummary]:
+    _ensure_initialized()
+    _ensure_cache_fresh()
+    with _SHOPS_LOCK:
+        return AREA_SUMMARY_CACHE.get(area_id)
+
+
+def get_station_summary(station: str) -> Optional[StationSummary]:
+    _ensure_initialized()
+    _ensure_cache_fresh()
+    with _SHOPS_LOCK:
+        return STATION_SUMMARY_BY_NAME.get(station)
+
+
+def search_stations(query: str, *, limit: int) -> Tuple[StationSummary, ...]:
+    _ensure_initialized()
+    _ensure_cache_fresh()
+    normalized = _normalize_station_for_search(query)
+    if not normalized:
+        return tuple()
+    matches: List[StationSummary] = []
+    seen: set[str] = set()
+    with _SHOPS_LOCK:
+        index = STATION_SEARCH_INDEX
+    for normalized_name, summary in index:
+        if normalized in normalized_name and summary.name not in seen:
+            matches.append(summary)
+            seen.add(summary.name)
+        if len(matches) >= limit:
+            break
+    return tuple(matches)
+
+
 def _refresh_shops_cache_sync() -> None:
     _ensure_initialized()
-    _load_shops_cache()
+    _load_reference_cache()
 
 
 async def refresh_shops_cache() -> None:
