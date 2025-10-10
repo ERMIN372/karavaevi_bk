@@ -30,6 +30,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 TECH_CHAT_ID = int(os.getenv("TECH_CHAT_ID", "0"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 DATE_WINDOW_DAYS = max(0, int(os.getenv("DATE_WINDOW_DAYS", "90")))
+DEBUG_UI = False
 ADMINS = {
     int(user_id)
     for user_id in os.getenv("ADMINS", "").split(",")
@@ -89,12 +90,17 @@ class RegistrationStates(StatesGroup):
 DATE_PLACEHOLDER = "например: 09.10 или “завтра”"
 DATE_PROMPT_MESSAGE = "Выбери дату или введи вручную: 09.10, “завтра”, “суббота”."
 DATE_PARSE_ERROR_MESSAGE = "Не понял дату. Введи как 09.10 или нажми кнопку ниже."
-DATE_CONFIRMATION_TEMPLATE = "Дата: {date_human} (ISO: {date_iso})"
+DATE_CONFIRMATION_TEMPLATE = "Дата: {date_human}"
 DATE_BUTTON_TODAY = "Сегодня"
 DATE_BUTTON_TOMORROW = "Завтра"
 BACK_COMMAND = "Назад"
 TIME_PROMPT_MESSAGE = (
-    "Время смены. Формат 09:00–18:00. Шаг 15 минут.\n"
+    "Время смены. Введите «начало–конец». Интервалы по 15 минут.\n"
+    "Примеры: 09:00–13:30, 12:15–16:45.\n"
+    "Допустимые форматы: 09:00–18:00, 9-18, 9:00-18:00 (любой дефис/тире)."
+)
+TIME_PARSE_ERROR_MESSAGE = (
+    "Ошибка: Неверный формат. Введите так: 09:00–18:00 (минуты только 00/15/30/45).\n"
     "Примеры: 09:00–13:30, 12:15–16:45."
 )
 TIME_PLACEHOLDER = "например: 09:00–13:30"
@@ -440,6 +446,16 @@ def format_human_date(value: date) -> str:
     return f"{weekday_name}, {value.day:02d} {month_name} {value.year}"
 
 
+def format_human_date_from_text(raw_value: Optional[str]) -> str:
+    if not raw_value:
+        return "—"
+    try:
+        parsed = date.fromisoformat(raw_value)
+    except ValueError:
+        return raw_value
+    return format_human_date(parsed)
+
+
 def format_compact_date_text(raw_value: str) -> str:
     if not raw_value:
         return "—"
@@ -570,7 +586,7 @@ def _parse_numeric_date(parts: Tuple[str, ...], today: date) -> Optional[date]:
 
 
 TIME_RANGE_PATTERN = re.compile(
-    r"^(\d{1,2})(?::?(\d{0,2}))?-(\d{1,2})(?::?(\d{0,2}))?$"
+    r"^(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?$"
 )
 
 
@@ -702,14 +718,18 @@ def build_shop_keyboard(
 def parse_time_range(raw_value: str) -> Optional[Tuple[str, str]]:
     if not raw_value:
         return None
-    normalized = raw_value.strip().lower()
-    normalized = normalized.replace(" ", "")
+    normalized = raw_value.strip()
+    if not normalized:
+        return None
     normalized = normalized.replace("—", "-")
     normalized = normalized.replace("–", "-")
     normalized = normalized.replace("−", "-")
+    normalized = normalized.replace("‑", "-")
+    normalized = normalized.replace("‒", "-")
     normalized = normalized.replace("..", ".")
     normalized = normalized.replace(",", ":")
     normalized = normalized.replace(".", ":")
+    normalized = re.sub(r"\s+", " ", normalized)
     match = TIME_RANGE_PATTERN.match(normalized)
     if not match:
         return None
@@ -718,23 +738,32 @@ def parse_time_range(raw_value: str) -> Optional[Tuple[str, str]]:
     end = _normalize_time_component(end_hour, end_minute)
     if not start or not end:
         return None
+    if _time_to_minutes(start) >= _time_to_minutes(end):
+        return None
     return start, end
 
 
 def _normalize_time_component(hour_text: str, minute_text: Optional[str]) -> Optional[str]:
-    hour = int(hour_text)
+    try:
+        hour = int(hour_text)
+    except ValueError:
+        return None
     if not 0 <= hour <= 23:
         return None
-    if minute_text:
-        if len(minute_text) == 1:
-            minute = int(minute_text) * 10
-        else:
-            minute = int(minute_text)
-    else:
+    if minute_text is None:
         minute = 0
+    else:
+        if minute_text not in {"00", "15", "30", "45"}:
+            return None
+        minute = int(minute_text)
     if not 0 <= minute < 60:
         return None
     return f"{hour:02d}:{minute:02d}"
+
+
+def _time_to_minutes(value: str) -> int:
+    hours, minutes = value.split(":", 1)
+    return int(hours) * 60 + int(minutes)
 
 
 def resolve_flow(state_name: Optional[str]) -> Optional[str]:
@@ -779,8 +808,12 @@ async def apply_date_selection(
     date_iso = selected_date.isoformat()
     date_human = format_human_date(selected_date)
     await state.update_data(date=date_iso, date_human=date_human)
+    confirmation_text = DATE_CONFIRMATION_TEMPLATE.format(date_human=date_human)
+    if DEBUG_UI:
+        confirmation_text = f"{confirmation_text} (ISO: {date_iso})"
+    logging.debug("Пользователь выбрал дату %s (iso=%s)", date_human, date_iso)
     await message.answer(
-        DATE_CONFIRMATION_TEMPLATE.format(date_human=date_human, date_iso=date_iso),
+        confirmation_text,
         reply_markup=ReplyKeyboardRemove(),
     )
     await prompt_time_range(message, state, flow)
@@ -1089,6 +1122,7 @@ def build_request_markup(record: Dict[str, Any]) -> InlineKeyboardMarkup:
 def render_channel_post(record: Dict[str, Any]) -> str:
     shop_name = record.get("shop_name") or "Любая лавка"
     filled_slots, max_slots = get_request_slots(record)
+    date_display = format_human_date_from_text(record.get("date"))
     if record["kind"] == "director":
         title = "🔔 Заявка на подработку от директора лавки"
         position_value = (record.get("position") or "").strip() or "—"
@@ -1096,7 +1130,7 @@ def render_channel_post(record: Dict[str, Any]) -> str:
         lines = [
             title,
             f"Лавка: {shop_name}",
-            f"Дата: {record['date']}",
+            f"Дата: {date_display}",
             f"Смена: {record['time_from']}–{record['time_to']}",
             f"Должность: {position_value}",
             f"Комментарий: {note}",
@@ -1120,7 +1154,7 @@ def render_channel_post(record: Dict[str, Any]) -> str:
                 lines.append(f"Метро: {station}")
         lines.extend(
             [
-                f"Дата: {record['date']}",
+                f"Дата: {date_display}",
                 f"Смена: {record['time_from']}–{record['time_to']}",
                 f"Желаемая должность: {position_value}",
                 f"Пожелания: {note}",
@@ -1605,7 +1639,7 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         parsed_range = parse_time_range(message.text or "")
         if not parsed_range:
             await message.answer(
-                "Не понял время.\n" + TIME_PROMPT_MESSAGE,
+                f"{TIME_PARSE_ERROR_MESSAGE}\n{TIME_PROMPT_MESSAGE}",
                 reply_markup=build_back_keyboard(),
             )
             return
@@ -1713,9 +1747,12 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
         selected_shop = shops.get(data.get("shop_id")) if data.get("shop_id") is not None else None
         shop_name = data.get("shop_name") or (selected_shop.name if selected_shop else "Не выбрана")
         note_display = note_value if note_value else "—"
+        date_display = data.get("date_human") or format_human_date_from_text(
+            data.get("date")
+        )
         summary = (
             "Проверьте заявку:\n"
-            f"Дата: {data['date']}\n"
+            f"Дата: {date_display}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
             f"Лавка: {shop_name}\n"
             f"Должность: {position_value}\n"
@@ -2158,7 +2195,7 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         parsed_range = parse_time_range(message.text or "")
         if not parsed_range:
             await message.answer(
-                "Не понял время.\n" + TIME_PROMPT_MESSAGE,
+                f"{TIME_PARSE_ERROR_MESSAGE}\n{TIME_PROMPT_MESSAGE}",
                 reply_markup=build_back_keyboard(),
             )
             return
@@ -2261,9 +2298,12 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
             f"Метро: {station} · {distance} м" if distance is not None else f"Метро: {station}"
         )
         note_display = note_value if note_value else "—"
+        date_display = data.get("date_human") or format_human_date_from_text(
+            data.get("date")
+        )
         summary = (
             "Проверьте заявку:\n"
-            f"Дата: {data['date']}\n"
+            f"Дата: {date_display}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
             f"Лавка: {shop_name}\n"
             f"{metro_line}\n"
