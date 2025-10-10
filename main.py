@@ -104,7 +104,9 @@ INLINE_DATE_DAYS = 10
 DIRECTOR_BUTTON_TEXT = "🧑‍💼 Директор лавки"
 WORKER_BUTTON_TEXT = "👨‍🍳 Хочу подработать"
 
-AREA_PROMPT_MESSAGE = "Выбери район. Потом подберём метро и лавку рядом."
+AREA_PROMPT_MESSAGE = (
+    "Выбери район. На кнопках указаны примеры ближайших станций."
+)
 STATION_PROMPT_TEMPLATE = "Станции в «{area_name}». Выбери метро:"
 STATION_EMPTY_TEMPLATE = "В «{area_name}» сейчас нет вариантов. Выбери другой район."
 STATION_SEARCH_PROMPT = (
@@ -589,11 +591,66 @@ def _compute_page_bounds(length: int, page: int, per_page: int) -> Tuple[int, in
     return page, start, end, total_pages
 
 
+AREA_KEYBOARD_PRESETS: Dict[str, Dict[str, str]] = {
+    "CENTER": {"emoji": "🏙", "area": "Центр", "examples": "Тверская, Театральная"},
+    "CAO": {"emoji": "🏙", "area": "Центр", "examples": "Тверская, Театральная"},
+    "SAO": {"emoji": "⬆️", "area": "Север", "examples": "Сокол, Аэропорт"},
+    "NORTH": {"emoji": "⬆️", "area": "Север", "examples": "Сокол, Аэропорт"},
+    "SVAO": {"emoji": "↗️", "area": "Северо-Восток", "examples": "ВДНХ, Ботанический"},
+    "NORTH_EAST": {
+        "emoji": "↗️",
+        "area": "Северо-Восток",
+        "examples": "ВДНХ, Ботанический",
+    },
+    "VAO": {"emoji": "➡️", "area": "Восток", "examples": "Сокольники, Преображенская"},
+    "EAST": {
+        "emoji": "➡️",
+        "area": "Восток",
+        "examples": "Сокольники, Преображенская",
+    },
+    "YUVAO": {"emoji": "↘️", "area": "Юго-Восток", "examples": "Выхино, Кузьминки"},
+    "SOUTH_EAST": {
+        "emoji": "↘️",
+        "area": "Юго-Восток",
+        "examples": "Выхино, Кузьминки",
+    },
+    "YUAO": {"emoji": "⬇️", "area": "Юг", "examples": "Автозаводская, Варшавская"},
+    "SOUTH": {"emoji": "⬇️", "area": "Юг", "examples": "Автозаводская, Варшавская"},
+    "YUZAO": {"emoji": "↙️", "area": "Юго-Запад", "examples": "Профсоюзная, Университет"},
+    "SOUTH_WEST": {
+        "emoji": "↙️",
+        "area": "Юго-Запад",
+        "examples": "Профсоюзная, Университет",
+    },
+    "ZAO": {"emoji": "⬅️", "area": "Запад", "examples": "Озёрная, Говорово"},
+    "WEST": {"emoji": "⬅️", "area": "Запад", "examples": "Озёрная, Говорово"},
+    "SZAO": {"emoji": "↖️", "area": "Северо-Запад", "examples": ""},
+    "NORTH_WEST": {"emoji": "↖️", "area": "Северо-Запад", "examples": ""},
+    "TINAO": {"emoji": "🏡", "area": "ТиНАО", "examples": "Ольховая, Коммунарка"},
+    "MO": {"emoji": "🚆", "area": "МО/Пригород", "examples": "Мытищи"},
+    "MOSCOW_REGION": {"emoji": "🚆", "area": "МО/Пригород", "examples": "Мытищи"},
+}
+
+
 def build_area_keyboard(areas: List[storage.AreaSummary]) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=1)
     for area in areas:
-        emoji = f"{area.emoji} " if area.emoji else ""
-        button_text = f"{emoji}{area.title} ({area.shop_count})"
+        preset = AREA_KEYBOARD_PRESETS.get(area.area_id)
+        if preset is None:
+            emoji = f"{area.emoji} " if area.emoji else ""
+            button_text = f"{emoji}{area.title} ({area.shop_count})"
+        else:
+            if not preset.get("examples") and area.shop_count == 0:
+                continue
+            examples = preset.get("examples", "")
+            if not examples:
+                button_text = (
+                    f"{preset['emoji']} {preset['area']} ({area.shop_count})"
+                )
+            else:
+                button_text = (
+                    f"{preset['emoji']} {preset['area']} • {examples} ({area.shop_count})"
+                )
         markup.add(InlineKeyboardButton(button_text, callback_data=f"warea:{area.area_id}"))
     return markup
 
