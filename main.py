@@ -125,8 +125,23 @@ STATIONS_PER_PAGE = 10
 SHOPS_PER_PAGE = 10
 MAX_SEARCH_RESULTS = 50
 
+MAX_REQUEST_SLOTS_DEFAULT = 5
+LIMIT_REACHED_MESSAGE = (
+    "Эта заявка уже набрала 5 из 5.\n"
+    "Попробуй другую — рядом есть ещё хорошие варианты ✨"
+)
+EXPIRED_REQUEST_MESSAGE = (
+    "Упс, заявка уже закрыта. Загляни в свежие — они ждут тебя 🙌"
+)
+DISABLED_CALLBACK_DATA = "noop"
+
+REQUEST_LOCKS: Dict[int, asyncio.Lock] = {}
+REQUEST_LOCKS_MAP_LOCK = asyncio.Lock()
+
 SHOPS_REFRESH_INTERVAL_SECONDS = 15 * 60
 shops_refresh_task: Optional[asyncio.Task] = None
+REQUESTS_CLEANUP_INTERVAL_SECONDS = 60
+requests_cleanup_task: Optional[asyncio.Task] = None
 
 POSITION_BUTTON_OPTIONS: Tuple[str, ...] = (
     "Кассир",
@@ -910,6 +925,15 @@ def format_contact_details(
     return format_mention(entity)
 
 
+async def get_request_lock(request_id: int) -> asyncio.Lock:
+    async with REQUEST_LOCKS_MAP_LOCK:
+        lock = REQUEST_LOCKS.get(request_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            REQUEST_LOCKS[request_id] = lock
+    return lock
+
+
 def validate_timeslot(date_text: str, time_from_text: str, time_to_text: str) -> Optional[str]:
     try:
         date_obj = datetime.strptime(date_text, "%Y-%m-%d").date()
@@ -975,46 +999,194 @@ async def periodic_shops_refresh() -> None:
             logging.exception("Не удалось автоматически обновить справочник лавок: %s", exc)
 
 
+def get_request_slots(record: Dict[str, Any]) -> Tuple[int, int]:
+    try:
+        max_slots = int(record.get("max_slots") or MAX_REQUEST_SLOTS_DEFAULT)
+    except (TypeError, ValueError):
+        max_slots = MAX_REQUEST_SLOTS_DEFAULT
+    if max_slots <= 0:
+        max_slots = MAX_REQUEST_SLOTS_DEFAULT
+    if max_slots > MAX_REQUEST_SLOTS_DEFAULT:
+        max_slots = MAX_REQUEST_SLOTS_DEFAULT
+    try:
+        filled = int(record.get("filled_slots") or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    filled = max(0, min(filled, max_slots))
+    return filled, max_slots
+
+
+def build_request_markup(record: Dict[str, Any]) -> InlineKeyboardMarkup:
+    filled_slots, max_slots = get_request_slots(record)
+    markup = InlineKeyboardMarkup()
+    if filled_slots >= max_slots:
+        button_text = f"Мест нет (занято {filled_slots}/{max_slots})"
+        markup.add(InlineKeyboardButton(button_text, callback_data=DISABLED_CALLBACK_DATA))
+        return markup
+    request_id = record.get("id")
+    button_text = "Откликнуться" if record.get("kind") == "director" else "Пригласить"
+    markup.add(InlineKeyboardButton(button_text, callback_data=f"pick:{request_id}"))
+    return markup
+
+
 def render_channel_post(record: Dict[str, Any]) -> str:
     shop_name = record.get("shop_name") or "Любая лавка"
+    filled_slots, max_slots = get_request_slots(record)
     if record["kind"] == "director":
         title = "🔔 Заявка на подработку от директора лавки"
         position_value = (record.get("position") or "").strip() or "—"
         note = (record.get("note") or "").strip() or "—"
-        return (
-            f"{title}\n"
-            f"Лавка: {shop_name}\n"
-            f"Дата: {record['date']}\n"
-            f"Смена: {record['time_from']}–{record['time_to']}\n"
-            f"Должность: {position_value}\n"
-            f"Комментарий: {note}\n"
-            "Нажмите «Откликнуться», чтобы связаться с директором."
-        )
-    title = "💼 Сотрудник ищет смену"
-    position_value = (record.get("position") or "").strip() or "—"
-    note = (record.get("note") or "").strip() or "—"
-    station = record.get("chosen_metro") or ""
-    distance = record.get("chosen_metro_dist_m")
-    lines = [
-        title,
-        f"Лавка: {shop_name}",
-    ]
-    if station:
-        distance_text = f"{distance} м" if distance is not None else ""
-        if distance_text:
-            lines.append(f"Метро: {station} · {distance_text}")
-        else:
-            lines.append(f"Метро: {station}")
-    lines.extend(
-        [
+        lines = [
+            title,
+            f"Лавка: {shop_name}",
             f"Дата: {record['date']}",
             f"Смена: {record['time_from']}–{record['time_to']}",
-            f"Желаемая должность: {position_value}",
-            f"Пожелания: {note}",
-            "Нажмите «Пригласить», чтобы связаться с сотрудником.",
+            f"Должность: {position_value}",
+            f"Комментарий: {note}",
+            "Нажмите «Откликнуться», чтобы связаться с директором.",
         ]
-    )
+    else:
+        title = "💼 Сотрудник ищет смену"
+        position_value = (record.get("position") or "").strip() or "—"
+        note = (record.get("note") or "").strip() or "—"
+        station = record.get("chosen_metro") or ""
+        distance = record.get("chosen_metro_dist_m")
+        lines = [
+            title,
+            f"Лавка: {shop_name}",
+        ]
+        if station:
+            distance_text = f"{distance} м" if distance is not None else ""
+            if distance_text:
+                lines.append(f"Метро: {station} · {distance_text}")
+            else:
+                lines.append(f"Метро: {station}")
+        lines.extend(
+            [
+                f"Дата: {record['date']}",
+                f"Смена: {record['time_from']}–{record['time_to']}",
+                f"Желаемая должность: {position_value}",
+                f"Пожелания: {note}",
+                "Нажмите «Пригласить», чтобы связаться с сотрудником.",
+            ]
+        )
+    lines.append("")
+    lines.append(f"Статус: занято {filled_slots}/{max_slots}")
     return "\n".join(lines)
+
+
+async def cleanup_expired_requests() -> None:
+    try:
+        records = await storage.gs_list_requests()
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Не удалось получить список заявок для очистки: %s", exc)
+        return
+
+    now_local = now_in_timezone()
+    for record in records:
+        request_id = record.get("id")
+        if not request_id:
+            continue
+        status = str(record.get("status") or "").strip().lower()
+        if status in {"expired", "cancelled"}:
+            continue
+        end_dt_iso = record.get("end_dt_iso") or ""
+        if not end_dt_iso:
+            continue
+        try:
+            end_dt = datetime.fromisoformat(end_dt_iso)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=TIMEZONE)
+        except ValueError:
+            logging.warning(
+                "Не удалось распарсить время окончания смены для заявки %s: %s",
+                request_id,
+                end_dt_iso,
+            )
+            continue
+        if now_local <= end_dt + timedelta(minutes=1):
+            continue
+
+        lock = await get_request_lock(request_id)
+        async with lock:
+            latest = await storage.gs_find_request(request_id)
+            if not latest:
+                continue
+            latest_status = str(latest.get("status") or "").strip().lower()
+            if latest_status in {"expired", "cancelled"}:
+                continue
+            latest_end_iso = latest.get("end_dt_iso") or end_dt_iso
+            try:
+                latest_end = datetime.fromisoformat(latest_end_iso)
+                if latest_end.tzinfo is None:
+                    latest_end = latest_end.replace(tzinfo=TIMEZONE)
+            except ValueError:
+                latest_end = end_dt
+            if now_local <= latest_end + timedelta(minutes=1):
+                continue
+
+            message_id = latest.get("channel_message_id")
+            if message_id:
+                try:
+                    await bot.delete_message(CHANNEL_ID, message_id)
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug(
+                        "Не удалось удалить сообщение заявки %s: %s",
+                        request_id,
+                        exc,
+                    )
+            try:
+                await storage.gs_update_request_fields(
+                    request_id,
+                    {"status": "expired", "channel_message_id": ""},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.exception(
+                    "Не удалось обновить статус заявки %s при очистке: %s",
+                    request_id,
+                    exc,
+                )
+                continue
+
+            author_id = latest.get("author_id")
+            if author_id:
+                try:
+                    station_raw = (latest.get("chosen_metro") or "").strip()
+                    summary_line = build_request_summary_line(
+                        shop_name=html.escape(latest.get("shop_name") or "Любая лавка"),
+                        date_human=html.escape(
+                            format_compact_date_text(latest.get("date") or "")
+                        ),
+                        time_from=html.escape(latest.get("time_from") or "—"),
+                        time_to=html.escape(latest.get("time_to") or "—"),
+                        station=html.escape(station_raw) if station_raw else "",
+                    )
+                    expire_message = (
+                        f"⏱ Заявка №{html.escape(str(request_id))} завершена.\n"
+                        f"{summary_line}"
+                    )
+                    await bot.send_message(
+                        author_id,
+                        expire_message,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug(
+                        "Не удалось уведомить автора заявки %s о завершении: %s",
+                        request_id,
+                        exc,
+                    )
+
+
+async def periodic_requests_cleanup() -> None:
+    while True:
+        try:
+            await asyncio.sleep(REQUESTS_CLEANUP_INTERVAL_SECONDS)
+            await cleanup_expired_requests()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Ошибка при очистке завершённых заявок: %s", exc)
 
 
 async def on_callback_pick(call: CallbackQuery) -> None:
@@ -1025,119 +1197,180 @@ async def on_callback_pick(call: CallbackQuery) -> None:
         await call.answer("Некорректный формат заявки.", show_alert=True)
         return
 
-    try:
-        record = await storage.gs_find_request(request_id)
-        if not record:
-            await call.answer("Заявка не найдена или была удалена.", show_alert=True)
-            return
-
-        status = str(record.get("status") or "").strip().lower()
-        if status != "open":
-            await call.answer("Карточка уже закрыта. Спасибо, что откликнулись", show_alert=True)
-            return
-
-        picker = call.from_user
-        if record["author_id"] == picker.id:
-            await call.answer("Нельзя откликаться на собственную заявку.", show_alert=True)
-            return
-
-        author_chat = await bot.get_chat(record["author_id"])
-        picker_user_data = await storage.gs_get_user(picker.id)
-        author_user_data = await storage.gs_get_user(record["author_id"])
-        picker_contact = format_contact_details(picker_user_data, picker)
-        author_contact = format_contact_details(author_user_data, author_chat)
-
-        channel_message_id = call.message.message_id if call.message else None
-        channel_username = (
-            call.message.chat.username if call.message and call.message.chat else None
-        )
-        channel_message_url_raw = build_channel_message_url(
-            channel_message_id or record.get("channel_message_id"),
-            chat_username=channel_username,
-        )
-        channel_message_url = (
-            html.escape(channel_message_url_raw) if channel_message_url_raw else ""
-        )
-        station_raw = (record.get("chosen_metro") or "").strip()
-        summary_line = build_request_summary_line(
-            shop_name=html.escape(record.get("shop_name") or "Любая лавка"),
-            date_human=html.escape(format_compact_date_text(record.get("date") or "")),
-            time_from=html.escape(record.get("time_from") or "—"),
-            time_to=html.escape(record.get("time_to") or "—"),
-            station=html.escape(station_raw) if station_raw else "",
-        )
-        request_id_text = html.escape(str(request_id))
-        position_display = (record.get("position") or "").strip() or "—"
-        position_line = f"Должность: {html.escape(position_display)}"
-
-        def _with_optional_link(parts: List[str]) -> str:
-            if channel_message_url:
-                parts.append(f"Подробнее: {channel_message_url}")
-            return "\n".join(parts)
-
-        if record["kind"] == "director":
-            new_status = "picked"
-            message_for_author = _with_optional_link(
-                [
-                    f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}",
-                    summary_line,
-                    position_line,
-                    f"Контакт: {picker_contact}",
-                ]
-            )
-            message_for_picker = _with_optional_link(
-                [
-                    f"🎉 Вы откликнулись на смену по заявке №{request_id_text}",
-                    summary_line,
-                    position_line,
-                    f"Свяжитесь с директором: {author_contact}",
-                ]
-            )
-        else:
-            new_status = "invited"
-            message_for_picker = _with_optional_link(
-                [
-                    f"✅ Директор пригласил вас на смену по заявке №{request_id_text}",
-                    summary_line,
-                    position_line,
-                    f"Контакт: {author_contact}",
-                ]
-            )
-            message_for_author = _with_optional_link(
-                [
-                    f"🎉 Вы пригласили сотрудника на смену по заявке №{request_id_text}",
-                    summary_line,
-                    position_line,
-                    f"Контакт: {picker_contact}",
-                ]
-            )
-
-        await storage.gs_update_request_status(request_id, new_status, channel_message_id)
-
+    lock = await get_request_lock(request_id)
+    async with lock:
         try:
-            await bot.send_message(
-                record["author_id"], message_for_author, disable_web_page_preview=True
-            )
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("Не удалось уведомить автора заявки %s", record["author_id"])
-            await send_tech(
-                f"Не удалось уведомить автора заявки {record['author_id']}: {exc}"
+            record = await storage.gs_find_request(request_id)
+            if not record:
+                await call.answer(EXPIRED_REQUEST_MESSAGE, show_alert=True)
+                return
+
+            status = str(record.get("status") or "").strip().lower()
+            if status in {"expired", "cancelled"}:
+                await call.answer(EXPIRED_REQUEST_MESSAGE, show_alert=True)
+                return
+
+            picker = call.from_user
+            if record.get("author_id") == picker.id:
+                await call.answer("Нельзя откликаться на собственную заявку.", show_alert=True)
+                return
+
+            end_dt_iso = record.get("end_dt_iso")
+            if end_dt_iso:
+                try:
+                    end_dt = datetime.fromisoformat(end_dt_iso)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=TIMEZONE)
+                    if now_in_timezone() > end_dt + timedelta(minutes=1):
+                        await storage.gs_update_request_fields(request_id, {"status": "expired"})
+                        await call.answer(EXPIRED_REQUEST_MESSAGE, show_alert=True)
+                        return
+                except ValueError:
+                    logging.warning(
+                        "Не удалось распарсить время окончания смены для заявки %s: %s",
+                        request_id,
+                        end_dt_iso,
+                    )
+
+            filled_slots, max_slots = get_request_slots(record)
+            ids_key = "picked_ids" if record.get("kind") == "director" else "invited_ids"
+            current_ids = list(record.get(ids_key) or [])
+            if picker.id in current_ids:
+                await call.answer("Вы уже откликались по этой заявке.", show_alert=True)
+                return
+
+            if filled_slots >= max_slots:
+                await call.answer(LIMIT_REACHED_MESSAGE, show_alert=True)
+                return
+
+            current_ids.append(picker.id)
+            new_filled = len(current_ids)
+            new_status = "filled" if new_filled >= max_slots else "open"
+            updates = {
+                ids_key: current_ids,
+                "filled_slots": new_filled,
+                "status": new_status,
+                "channel_message_id": call.message.message_id if call.message else record.get("channel_message_id"),
+            }
+            await storage.gs_update_request_fields(request_id, updates)
+            updated_record = await storage.gs_find_request(request_id)
+            if not updated_record:
+                await call.answer(EXPIRED_REQUEST_MESSAGE, show_alert=True)
+                return
+
+            updated_filled, updated_max = get_request_slots(updated_record)
+            if updated_filled > updated_max:
+                await call.answer(LIMIT_REACHED_MESSAGE, show_alert=True)
+                return
+
+            author_chat = await bot.get_chat(updated_record["author_id"])
+            picker_user_data = await storage.gs_get_user(picker.id)
+            author_user_data = await storage.gs_get_user(updated_record["author_id"])
+            picker_contact = html.escape(format_contact_details(picker_user_data, picker))
+            author_contact = html.escape(
+                format_contact_details(author_user_data, author_chat)
             )
 
-        try:
-            await bot.send_message(
-                picker.id, message_for_picker, disable_web_page_preview=True
+            station_raw = (updated_record.get("chosen_metro") or "").strip()
+            summary_line = build_request_summary_line(
+                shop_name=html.escape(updated_record.get("shop_name") or "Любая лавка"),
+                date_human=html.escape(
+                    format_compact_date_text(updated_record.get("date") or "")
+                ),
+                time_from=html.escape(updated_record.get("time_from") or "—"),
+                time_to=html.escape(updated_record.get("time_to") or "—"),
+                station=html.escape(station_raw) if station_raw else "",
             )
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("Не удалось уведомить участника %s", picker.id)
-            await send_tech(f"Не удалось уведомить пользователя {picker.id}: {exc}")
+            request_id_text = html.escape(str(request_id))
 
-        logging.info("Заявка %s изменила статус на %s", request_id, new_status)
-        await call.answer("Контакты отправлены в личные сообщения.")
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("Ошибка при обработке отклика на заявку %s", call.data)
-        await call.answer("Что-то пошло не так. Мы уже разбираемся.", show_alert=True)
-        await send_tech(f"Ошибка при обработке отклика: {exc}")
+            if updated_record.get("kind") == "director":
+                message_for_author = (
+                    f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}\n"
+                    f"{summary_line}\n"
+                    f"Контакт сотрудника: {picker_contact}"
+                )
+                message_for_picker = (
+                    f"🎉 Вы откликнулись на смену по заявке №{request_id_text}\n"
+                    f"{summary_line}\n"
+                    f"Свяжитесь с директором: {author_contact}"
+                )
+            else:
+                message_for_picker = (
+                    f"✅ Вы пригласили по заявке №{request_id_text}\n"
+                    f"{summary_line}\n"
+                    f"Контакт сотрудника: {author_contact}"
+                )
+                message_for_author = (
+                    f"🎉 Директор пригласил вас на смену по заявке №{request_id_text}\n"
+                    f"{summary_line}\n"
+                    f"Контакт директора: {picker_contact}"
+                )
+
+            try:
+                await bot.send_message(
+                    updated_record["author_id"],
+                    message_for_author,
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.exception(
+                    "Не удалось уведомить автора заявки %s", updated_record["author_id"]
+                )
+                await send_tech(
+                    f"Не удалось уведомить автора заявки {updated_record['author_id']}: {exc}"
+                )
+
+            try:
+                await bot.send_message(
+                    picker.id, message_for_picker, disable_web_page_preview=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Не удалось уведомить участника %s", picker.id)
+                await send_tech(f"Не удалось уведомить пользователя {picker.id}: {exc}")
+
+            updated_text = render_channel_post(updated_record)
+            updated_markup = build_request_markup(updated_record)
+            target_message_id = (
+                call.message.message_id
+                if call.message and call.message.message_id
+                else updated_record.get("channel_message_id")
+            )
+            target_chat_id = (
+                call.message.chat.id
+                if call.message and call.message.chat
+                else CHANNEL_ID
+            )
+            if target_message_id:
+                try:
+                    await bot.edit_message_text(
+                        updated_text,
+                        target_chat_id,
+                        target_message_id,
+                        reply_markup=updated_markup,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception(
+                        "Не удалось обновить сообщение заявки %s: %s",
+                        request_id,
+                        exc,
+                    )
+            logging.info(
+                "Пользователь %s обновил заявку %s (%s/%s)",
+                picker.id,
+                request_id,
+                updated_filled,
+                updated_max,
+            )
+            await call.answer("Контакты отправлены в личные сообщения.")
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Ошибка при обработке отклика на заявку %s", call.data)
+            await call.answer("Что-то пошло не так. Мы уже разбираемся.", show_alert=True)
+            await send_tech(f"Ошибка при обработке отклика: {exc}")
+
+
+async def on_disabled_callback(call: CallbackQuery) -> None:
+    await call.answer(LIMIT_REACHED_MESSAGE, show_alert=True)
 
 
 async def handle_post_publication(
@@ -1185,7 +1418,28 @@ async def handle_post_publication(
         "author_id": author.id,
         "shop_name": shop_name,
         "status": "open",
+        "max_slots": MAX_REQUEST_SLOTS_DEFAULT,
+        "picked_ids": [],
+        "invited_ids": [],
+        "filled_slots": 0,
     }
+
+    end_dt_iso = ""
+    date_raw = data.get("date")
+    time_to_raw = data.get("time_to")
+    if date_raw and time_to_raw:
+        try:
+            date_obj = datetime.strptime(date_raw, "%Y-%m-%d").date()
+            time_to_obj = datetime.strptime(time_to_raw, "%H:%M").time()
+            end_dt = datetime.combine(date_obj, time_to_obj, tzinfo=TIMEZONE)
+            end_dt_iso = end_dt.isoformat()
+        except ValueError:
+            logging.warning(
+                "Не удалось вычислить окончание смены для заявки: %s %s",
+                date_raw,
+                time_to_raw,
+            )
+    payload["end_dt_iso"] = end_dt_iso
 
     now_iso = datetime.now(timezone.utc).isoformat()
     payload["created_at"] = now_iso
@@ -1193,10 +1447,7 @@ async def handle_post_publication(
     request_id, _ = await storage.gs_append_request(payload)
     payload["id"] = request_id
     text = render_channel_post(payload)
-    button_text = "Откликнуться" if kind == "director" else "Пригласить"
-    markup = InlineKeyboardMarkup().add(
-        InlineKeyboardButton(button_text, callback_data=f"pick:{request_id}")
-    )
+    markup = build_request_markup(payload)
     channel_message = await bot.send_message(CHANNEL_ID, text, reply_markup=markup)
     try:
         await storage.gs_update_request_status(
@@ -2044,6 +2295,13 @@ async def on_startup(_: Dispatcher) -> None:
     if shops_refresh_task is None:
         shops_refresh_task = asyncio.create_task(periodic_shops_refresh())
         logging.info("Запущено автоматическое обновление справочника лавок каждые %s секунд", SHOPS_REFRESH_INTERVAL_SECONDS)
+    global requests_cleanup_task
+    if requests_cleanup_task is None:
+        requests_cleanup_task = asyncio.create_task(periodic_requests_cleanup())
+        logging.info(
+            "Запущена автоматическая очистка заявок каждые %s секунд",
+            REQUESTS_CLEANUP_INTERVAL_SECONDS,
+        )
     if WEBHOOK_URL:
         webhook_url = WEBHOOK_URL + WEBHOOK_PATH
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -2061,6 +2319,14 @@ async def on_shutdown(_: Dispatcher) -> None:
         except asyncio.CancelledError:
             pass
         shops_refresh_task = None
+    global requests_cleanup_task
+    if requests_cleanup_task:
+        requests_cleanup_task.cancel()
+        try:
+            await requests_cleanup_task
+        except asyncio.CancelledError:
+            pass
+        requests_cleanup_task = None
     if WEBHOOK_URL:
         await bot.delete_webhook()
         logging.info("Webhook удален")
@@ -2087,6 +2353,9 @@ def register_handlers() -> None:
             WorkerStates.note,
             WorkerStates.confirm,
         ],
+    )
+    dp.register_callback_query_handler(
+        on_disabled_callback, lambda c: c.data == DISABLED_CALLBACK_DATA
     )
     dp.register_callback_query_handler(on_callback_pick, lambda c: c.data and c.data.startswith("pick:"))
 
