@@ -1283,28 +1283,49 @@ async def on_callback_pick(call: CallbackQuery) -> None:
             )
             request_id_text = html.escape(str(request_id))
 
+            channel_message_id = updated_record.get("channel_message_id")
+            chat_username = updated_record.get("channel_username")
+            request_link = build_channel_message_url(
+                channel_message_id, chat_username=chat_username
+            )
+            link_line = (
+                f"Ссылка на заявку: {html.escape(request_link)}"
+                if request_link
+                else ""
+            )
+
             if updated_record.get("kind") == "director":
-                message_for_author = (
-                    f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}\n"
-                    f"{summary_line}\n"
-                    f"Контакт сотрудника: {picker_contact}"
-                )
-                message_for_picker = (
-                    f"🎉 Вы откликнулись на смену по заявке №{request_id_text}\n"
-                    f"{summary_line}\n"
-                    f"Свяжитесь с директором: {author_contact}"
-                )
+                author_lines = [
+                    f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}",
+                    summary_line,
+                ]
+                picker_lines = [
+                    f"🎉 Вы откликнулись на смену по заявке №{request_id_text}",
+                    summary_line,
+                ]
+                if link_line:
+                    author_lines.append(link_line)
+                    picker_lines.append(link_line)
+                author_lines.append(f"Контакт сотрудника: {picker_contact}")
+                picker_lines.append(f"Свяжитесь с директором: {author_contact}")
+                message_for_author = "\n".join(author_lines)
+                message_for_picker = "\n".join(picker_lines)
             else:
-                message_for_picker = (
-                    f"✅ Вы пригласили по заявке №{request_id_text}\n"
-                    f"{summary_line}\n"
-                    f"Контакт сотрудника: {author_contact}"
-                )
-                message_for_author = (
-                    f"🎉 Директор пригласил вас на смену по заявке №{request_id_text}\n"
-                    f"{summary_line}\n"
-                    f"Контакт директора: {picker_contact}"
-                )
+                picker_lines = [
+                    f"✅ Вы пригласили по заявке №{request_id_text}",
+                    summary_line,
+                ]
+                author_lines = [
+                    f"🎉 Директор пригласил вас на смену по заявке №{request_id_text}",
+                    summary_line,
+                ]
+                if link_line:
+                    picker_lines.append(link_line)
+                    author_lines.append(link_line)
+                picker_lines.append(f"Контакт сотрудника: {author_contact}")
+                author_lines.append(f"Контакт директора: {picker_contact}")
+                message_for_picker = "\n".join(picker_lines)
+                message_for_author = "\n".join(author_lines)
 
             try:
                 await bot.send_message(
