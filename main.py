@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import re
@@ -126,6 +127,7 @@ SHOPS_REFRESH_INTERVAL_SECONDS = 15 * 60
 shops_refresh_task: Optional[asyncio.Task] = None
 
 WEEKDAY_SHORT_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+WEEKDAY_COMPACT_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 WEEKDAY_FULL_NAMES = [
     "Понедельник",
     "Вторник",
@@ -219,6 +221,48 @@ def format_human_date(value: date) -> str:
     weekday_name = WEEKDAY_FULL_NAMES[value.weekday()]
     month_name = MONTH_GENITIVE[value.month]
     return f"{weekday_name}, {value.day:02d} {month_name} {value.year}"
+
+
+def format_compact_date_text(raw_value: str) -> str:
+    if not raw_value:
+        return "—"
+    try:
+        parsed = datetime.strptime(raw_value, "%Y-%m-%d").date()
+    except ValueError:
+        return raw_value
+    weekday = WEEKDAY_COMPACT_NAMES[parsed.weekday()]
+    return f"{weekday}, {parsed.strftime('%d.%m')}"
+
+
+def build_channel_message_url(
+    message_id: Optional[int], *, chat_username: Optional[str] = None
+) -> Optional[str]:
+    if not message_id:
+        return None
+    if chat_username:
+        username = chat_username.lstrip("@")
+        if username:
+            return f"https://t.me/{username}/{message_id}"
+    if not CHANNEL_ID:
+        return None
+    identifier = str(abs(CHANNEL_ID))
+    if identifier.startswith("100"):
+        identifier = identifier[3:]
+    return f"https://t.me/c/{identifier}/{message_id}"
+
+
+def build_request_summary_line(
+    *,
+    shop_name: str,
+    date_human: str,
+    time_from: str,
+    time_to: str,
+    station: str,
+) -> str:
+    station_part = f" • {station}" if station else ""
+    return (
+        f"<b>{shop_name}</b> • {date_human} • {time_from}-{time_to}{station_part}"
+    )
 
 
 def _normalize_text(value: str) -> str:
@@ -792,28 +836,65 @@ async def on_callback_pick(call: CallbackQuery) -> None:
         picker_contact = format_contact_details(picker_user_data, picker)
         author_contact = format_contact_details(author_user_data, author_chat)
 
+        channel_message_id = call.message.message_id if call.message else None
+        channel_username = (
+            call.message.chat.username if call.message and call.message.chat else None
+        )
+        channel_message_url_raw = build_channel_message_url(
+            channel_message_id or record.get("channel_message_id"),
+            chat_username=channel_username,
+        )
+        channel_message_url = (
+            html.escape(channel_message_url_raw) if channel_message_url_raw else ""
+        )
+        station_raw = (record.get("chosen_metro") or "").strip()
+        summary_line = build_request_summary_line(
+            shop_name=html.escape(record.get("shop_name") or "Любая лавка"),
+            date_human=html.escape(format_compact_date_text(record.get("date") or "")),
+            time_from=html.escape(record.get("time_from") or "—"),
+            time_to=html.escape(record.get("time_to") or "—"),
+            station=html.escape(station_raw) if station_raw else "",
+        )
+        request_id_text = html.escape(str(request_id))
+
+        def _with_optional_link(parts: List[str]) -> str:
+            if channel_message_url:
+                parts.append(f"Подробнее: {channel_message_url}")
+            return "\n".join(parts)
+
         if record["kind"] == "director":
-            new_status = "assigned"
-            message_for_author = (
-                "✅ Сотрудник откликнулся на вашу заявку!\n"
-                f"Контакт: {picker_contact}"
+            new_status = "picked"
+            message_for_author = _with_optional_link(
+                [
+                    f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}",
+                    summary_line,
+                    f"Контакт: {picker_contact}",
+                ]
             )
-            message_for_picker = (
-                "🎉 Вы откликнулись на смену!\n"
-                f"Свяжитесь с директором: {author_contact}"
+            message_for_picker = _with_optional_link(
+                [
+                    f"🎉 Вы откликнулись на смену по заявке №{request_id_text}",
+                    summary_line,
+                    f"Свяжитесь с директором: {author_contact}",
+                ]
             )
         else:
-            new_status = "picked"
-            message_for_author = (
-                "✅ Директор пригласил вас на смену!\n"
-                f"Свяжитесь с директором: {picker_contact}"
+            new_status = "invited"
+            message_for_picker = _with_optional_link(
+                [
+                    f"✅ Директор пригласил вас на смену по заявке №{request_id_text}",
+                    summary_line,
+                    f"Контакт: {author_contact}",
+                ]
             )
-            message_for_picker = (
-                "🎉 Вы пригласили сотрудника на смену!\n"
-                f"Контакт: {author_contact}"
+            message_for_author = _with_optional_link(
+                [
+                    f"🎉 Вы пригласили сотрудника на смену по заявке №{request_id_text}",
+                    summary_line,
+                    f"Контакт: {picker_contact}",
+                ]
             )
 
-        channel_message_id = call.message.message_id if call.message else None
         await storage.gs_update_request_status(request_id, new_status, channel_message_id)
 
         try:
