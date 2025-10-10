@@ -65,6 +65,7 @@ class DirectorStates(StatesGroup):
     date = State()
     time_range = State()
     shop = State()
+    position = State()
     note = State()
     confirm = State()
 
@@ -76,6 +77,7 @@ class WorkerStates(StatesGroup):
     shop = State()
     date = State()
     time_range = State()
+    position = State()
     note = State()
     confirm = State()
 
@@ -125,6 +127,33 @@ MAX_SEARCH_RESULTS = 50
 
 SHOPS_REFRESH_INTERVAL_SECONDS = 15 * 60
 shops_refresh_task: Optional[asyncio.Task] = None
+
+POSITION_BUTTON_OPTIONS: Tuple[str, ...] = (
+    "Кассир",
+    "Бариста",
+    "Повар",
+    "Повар-универсал",
+    "РТЗ",
+    "Уборщик",
+)
+POSITION_PROMPTS: Dict[str, str] = {
+    "director": "Укажите требуемую должность. Можно выбрать кнопку или ввести свою.",
+    "worker": "Укажите желаемую должность. Можно выбрать кнопку или ввести свою.",
+}
+POSITION_CUSTOM_BUTTON = "Другая…"
+POSITION_BACK_BUTTON = "⬅️ Назад"
+POSITION_CUSTOM_PROMPT = (
+    "Введите должность текстом. От 2 до 30 символов. Допустимы буквы, пробел и дефис."
+)
+POSITION_ALLOWED_PATTERN = re.compile(r"^[A-Za-zА-Яа-яЁё\s-]+$")
+POSITION_MIN_LENGTH = 2
+POSITION_MAX_LENGTH = 30
+POSITION_SYNONYMS: Dict[str, str] = {
+    "повар универсал": "Повар-универсал",
+    "повар-универсал": "Повар-универсал",
+    "универсал": "Повар-универсал",
+    "ртз": "РТЗ",
+}
 
 WEEKDAY_SHORT_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 WEEKDAY_COMPACT_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -215,6 +244,177 @@ def build_inline_date_keyboard(base_date: date) -> InlineKeyboardMarkup:
             )
         )
     return markup
+
+
+def build_position_keyboard(flow: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=3)
+    for index, label in enumerate(POSITION_BUTTON_OPTIONS):
+        markup.insert(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"{flow}_position:{index}",
+            )
+        )
+    markup.row(
+        InlineKeyboardButton(
+            POSITION_CUSTOM_BUTTON, callback_data=f"{flow}_position:custom"
+        ),
+        InlineKeyboardButton(
+            POSITION_BACK_BUTTON, callback_data=f"{flow}_position:back"
+        ),
+    )
+    return markup
+
+
+def _canonicalize_position_key(value: str) -> str:
+    text = value.strip().lower()
+    text = text.replace("ё", "е")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+    text = text.replace("−", "-")
+    text = re.sub(r"\s*-[\s-]*", "-", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _capitalize_position_text(value: str) -> str:
+    words = []
+    for word in value.split(" "):
+        parts = []
+        for part in word.split("-"):
+            if not part:
+                parts.append(part)
+            else:
+                parts.append(part[0].upper() + part[1:].lower())
+        words.append("-".join(parts))
+    return " ".join(words)
+
+
+def normalize_position_input(raw_value: str) -> Tuple[Optional[str], Optional[str]]:
+    if raw_value is None:
+        return None, "Пожалуйста, укажите должность."
+    candidate = raw_value.strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    candidate = candidate.replace("–", "-")
+    candidate = candidate.replace("—", "-")
+    candidate = candidate.replace("−", "-")
+    candidate = re.sub(r"\s*-[\s-]*", "-", candidate)
+    candidate = re.sub(r"\s+", " ", candidate)
+    if not candidate:
+        return None, "Пожалуйста, укажите должность."
+    length = len(candidate)
+    if length < POSITION_MIN_LENGTH:
+        return None, "Название должности слишком короткое. Минимум 2 символа."
+    if length > POSITION_MAX_LENGTH:
+        return None, "Название должности слишком длинное. Сократите до 30 символов."
+    if not POSITION_ALLOWED_PATTERN.match(candidate):
+        return None, "Можно использовать только буквы, пробел и дефис. Попробуйте ещё раз."
+    normalized_key = _canonicalize_position_key(candidate)
+    if normalized_key in POSITION_SYNONYMS:
+        return POSITION_SYNONYMS[normalized_key], None
+    return _capitalize_position_text(candidate), None
+
+
+def build_position_prompt(
+    flow: str,
+    *,
+    current: Optional[str] = None,
+    reminder: Optional[str] = None,
+) -> str:
+    base = POSITION_PROMPTS.get(flow, POSITION_PROMPTS["worker"])
+    parts = []
+    if reminder:
+        parts.append(reminder)
+    parts.append(base)
+    if current:
+        parts.append(f"Сейчас выбрано: {current}")
+    return "\n\n".join(parts)
+
+
+async def present_position_step(
+    target_message: types.Message,
+    state: FSMContext,
+    flow: str,
+    *,
+    via_edit: bool,
+    reminder: Optional[str] = None,
+) -> None:
+    state_cls = DirectorStates if flow == "director" else WorkerStates
+    data = await state.get_data()
+    current = data.get("position") if isinstance(data, dict) else None
+    prompt_text = build_position_prompt(flow, current=current, reminder=reminder)
+    markup = build_position_keyboard(flow)
+    prompt_message: Optional[types.Message] = None
+    if via_edit:
+        try:
+            await target_message.edit_text(prompt_text, reply_markup=markup)
+            prompt_message = target_message
+        except Exception:  # noqa: BLE001
+            logging.debug(
+                "Не удалось обновить сообщение с выбором должности, отправляем новое"
+            )
+    if prompt_message is None:
+        prompt_message = await target_message.answer(prompt_text, reply_markup=markup)
+    await state.set_state(state_cls.position.state)
+    prompt_context = {
+        "message_id": prompt_message.message_id,
+    }
+    if prompt_message.chat:
+        prompt_context["chat_id"] = prompt_message.chat.id
+    await state.update_data(position_prompt=prompt_context)
+
+
+async def proceed_to_note_step(
+    flow: str,
+    source_message: types.Message,
+    state: FSMContext,
+    *,
+    via_edit: bool,
+) -> None:
+    state_cls = DirectorStates if flow == "director" else WorkerStates
+    position_value = None
+    prompt_context: Dict[str, Any] = {}
+    data = await state.get_data()
+    if isinstance(data, dict):
+        position_value = data.get("position")
+        context_value = data.get("position_prompt")
+        if isinstance(context_value, dict):
+            prompt_context = context_value
+    display_value = position_value or "должность выбрана"
+    edited = False
+    if via_edit:
+        try:
+            await source_message.edit_text(f"Должность: {display_value}")
+            edited = True
+        except Exception:  # noqa: BLE001
+            logging.debug("Не удалось обновить сообщение с выбранной должностью напрямую")
+    if not edited and prompt_context:
+        chat_id = prompt_context.get("chat_id")
+        message_id = prompt_context.get("message_id")
+        if chat_id and message_id:
+            try:
+                await bot.edit_message_text(
+                    f"Должность: {display_value}", chat_id, message_id
+                )
+                edited = True
+            except Exception:  # noqa: BLE001
+                try:
+                    await bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+                    edited = True
+                except Exception:  # noqa: BLE001
+                    logging.debug("Не удалось скрыть клавиатуру выбора должности")
+    await state.set_state(state_cls.note.state)
+    if flow == "director":
+        prompt = (
+            "Добавьте комментарий к заявке. Если ничего не нужно, отправьте «—». "
+            "Чтобы вернуться к выбору должности, напишите «Назад»."
+        )
+    else:
+        prompt = (
+            "Оставьте пожелания по смене. Если нечего добавить, отправьте «—». "
+            "Чтобы вернуться к выбору должности, напишите «Назад»."
+        )
+    await source_message.answer(prompt, reply_markup=ReplyKeyboardRemove())
 
 
 def format_human_date(value: date) -> str:
@@ -598,7 +798,14 @@ async def handle_back_to_date(message: types.Message, state: FSMContext) -> None
     await start_date_step(message, state, flow)
     preserved_keys = {
         key: existing_data[key]
-        for key in ("shop_id", "shop_name", "chosen_metro", "chosen_metro_dist_m", "note")
+        for key in (
+            "shop_id",
+            "shop_name",
+            "chosen_metro",
+            "chosen_metro_dist_m",
+            "note",
+            "position",
+        )
         if key in existing_data
     }
     if preserved_keys:
@@ -772,17 +979,20 @@ def render_channel_post(record: Dict[str, Any]) -> str:
     shop_name = record.get("shop_name") or "Любая лавка"
     if record["kind"] == "director":
         title = "🔔 Заявка на подработку от директора лавки"
-        note = record.get("note") or "Без комментариев"
+        position_value = (record.get("position") or "").strip() or "—"
+        note = (record.get("note") or "").strip() or "—"
         return (
             f"{title}\n"
             f"Лавка: {shop_name}\n"
             f"Дата: {record['date']}\n"
             f"Смена: {record['time_from']}–{record['time_to']}\n"
+            f"Должность: {position_value}\n"
             f"Комментарий: {note}\n"
             "Нажмите «Откликнуться», чтобы связаться с директором."
         )
     title = "💼 Сотрудник ищет смену"
-    note = record.get("note") or "Без комментариев"
+    position_value = (record.get("position") or "").strip() or "—"
+    note = (record.get("note") or "").strip() or "—"
     station = record.get("chosen_metro") or ""
     distance = record.get("chosen_metro_dist_m")
     lines = [
@@ -799,6 +1009,7 @@ def render_channel_post(record: Dict[str, Any]) -> str:
         [
             f"Дата: {record['date']}",
             f"Смена: {record['time_from']}–{record['time_to']}",
+            f"Желаемая должность: {position_value}",
             f"Пожелания: {note}",
             "Нажмите «Пригласить», чтобы связаться с сотрудником.",
         ]
@@ -856,6 +1067,8 @@ async def on_callback_pick(call: CallbackQuery) -> None:
             station=html.escape(station_raw) if station_raw else "",
         )
         request_id_text = html.escape(str(request_id))
+        position_display = (record.get("position") or "").strip() or "—"
+        position_line = f"Должность: {html.escape(position_display)}"
 
         def _with_optional_link(parts: List[str]) -> str:
             if channel_message_url:
@@ -868,6 +1081,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 [
                     f"✅ Сотрудник откликнулся на вашу заявку №{request_id_text}",
                     summary_line,
+                    position_line,
                     f"Контакт: {picker_contact}",
                 ]
             )
@@ -875,6 +1089,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 [
                     f"🎉 Вы откликнулись на смену по заявке №{request_id_text}",
                     summary_line,
+                    position_line,
                     f"Свяжитесь с директором: {author_contact}",
                 ]
             )
@@ -884,6 +1099,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 [
                     f"✅ Директор пригласил вас на смену по заявке №{request_id_text}",
                     summary_line,
+                    position_line,
                     f"Контакт: {author_contact}",
                 ]
             )
@@ -891,6 +1107,7 @@ async def on_callback_pick(call: CallbackQuery) -> None:
                 [
                     f"🎉 Вы пригласили сотрудника на смену по заявке №{request_id_text}",
                     summary_line,
+                    position_line,
                     f"Контакт: {picker_contact}",
                 ]
             )
@@ -932,7 +1149,18 @@ async def handle_post_publication(
     data = await state.get_data()
     shop_id = data.get("shop_id")
     shop_name = data.get("shop_name")
+    position_value = (data.get("position") or "").strip()
     shops = await fetch_shops()
+    if not position_value:
+        state_cls = DirectorStates if kind == "director" else WorkerStates
+        await state.set_state(state_cls.position.state)
+        prompt_text = build_position_prompt(kind, reminder="Это обязательное поле.")
+        markup = build_position_keyboard(kind)
+        sent = await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        await state.update_data(
+            position_prompt={"chat_id": sent.chat.id if sent.chat else chat_id, "message_id": sent.message_id}
+        )
+        return
     if shop_id is not None:
         if shop_id not in shops:
             await bot.send_message(
@@ -952,6 +1180,7 @@ async def handle_post_publication(
         "shop_id": shop_id,
         "chosen_metro": data.get("chosen_metro"),
         "chosen_metro_dist_m": data.get("chosen_metro_dist_m"),
+        "position": position_value,
         "note": data.get("note"),
         "author_id": author.id,
         "shop_name": shop_name,
@@ -988,6 +1217,43 @@ async def handle_post_publication(
         kind,
     )
     await state.finish()
+
+
+async def present_director_shop_menu(
+    target_message: types.Message, state: FSMContext, *, via_edit: bool
+) -> bool:
+    shops = await fetch_shops()
+    if not shops:
+        await state.finish()
+        text = (
+            "Список лавок пуст. Обратитесь к администратору для настройки справочника."
+        )
+        markup = build_start_keyboard()
+        if via_edit:
+            try:
+                await target_message.edit_text(text, reply_markup=markup)
+                return False
+            except Exception:  # noqa: BLE001
+                logging.debug(
+                    "Не удалось обновить список лавок для директора, отправляем новое сообщение"
+                )
+        await target_message.answer(text, reply_markup=markup)
+        return False
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    sorted_shops = sorted(shops.values(), key=lambda record: record.name.lower())
+    for shop in sorted_shops:
+        keyboard.insert(
+            InlineKeyboardButton(shop.name, callback_data=f"director_shop:{shop.id}")
+        )
+    await state.set_state(DirectorStates.shop.state)
+    if via_edit:
+        try:
+            await target_message.edit_text("Выберите вашу лавку:", reply_markup=keyboard)
+            return True
+        except Exception:  # noqa: BLE001
+            logging.debug("Не удалось обновить список лавок, отправляем новое сообщение")
+    await target_message.answer("Выберите вашу лавку:", reply_markup=keyboard)
+    return True
 
 
 def run_director_flow(dispatcher: Dispatcher) -> None:
@@ -1032,22 +1298,8 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             TIME_CONFIRMATION_TEMPLATE.format(time_from=time_from, time_to=time_to),
             reply_markup=ReplyKeyboardRemove(),
         )
-        shops = await fetch_shops()
-        if not shops:
-            await message.answer(
-                "Список лавок пуст. Обратитесь к администратору для настройки справочника.",
-                reply_markup=build_start_keyboard(),
-            )
-            await state.finish()
+        if not await present_director_shop_menu(message, state, via_edit=False):
             return
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        sorted_shops = sorted(shops.values(), key=lambda record: record.name.lower())
-        for shop in sorted_shops:
-            keyboard.insert(
-                InlineKeyboardButton(shop.name, callback_data=f"director_shop:{shop.id}")
-            )
-        await state.set_state(DirectorStates.shop.state)
-        await message.answer("Выберите вашу лавку:", reply_markup=keyboard)
 
     @dispatcher.callback_query_handler(
         lambda c: c.data.startswith("director_shop:"), state=DirectorStates.shop
@@ -1060,25 +1312,85 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
             return
         await call.answer()
         await state.update_data(shop_id=shop_id, shop_name=shops[shop_id].name)
-        await call.message.edit_text("Добавьте комментарий(например: какая должность вам требуется в лавку). Если не нужно, напишите «Без комментариев».")
-        await DirectorStates.note.set()
+        await present_position_step(call.message, state, "director", via_edit=True)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data and c.data.startswith("director_position:"),
+        state=DirectorStates.position,
+    )
+    async def director_position_choice(call: CallbackQuery, state: FSMContext) -> None:
+        try:
+            _, action = (call.data or "").split(":", 1)
+        except ValueError:
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        if action == "back":
+            await call.answer()
+            await present_director_shop_menu(call.message, state, via_edit=True)
+            return
+        if action == "custom":
+            await call.answer()
+            await call.message.answer(POSITION_CUSTOM_PROMPT)
+            return
+        try:
+            index = int(action)
+        except ValueError:
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        if index < 0 or index >= len(POSITION_BUTTON_OPTIONS):
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        position_value = POSITION_BUTTON_OPTIONS[index]
+        await state.update_data(position=position_value)
+        await call.answer("Готово")
+        await proceed_to_note_step("director", call.message, state, via_edit=True)
+
+    @dispatcher.message_handler(state=DirectorStates.position)
+    async def director_position_input(message: types.Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer(POSITION_CUSTOM_PROMPT)
+            return
+        if text.lower() == BACK_COMMAND.lower():
+            await present_director_shop_menu(message, state, via_edit=False)
+            return
+        normalized, error = normalize_position_input(text)
+        if error:
+            await message.answer(f"{error}\n{POSITION_CUSTOM_PROMPT}")
+            return
+        await state.update_data(position=normalized)
+        await proceed_to_note_step("director", message, state, via_edit=False)
 
     @dispatcher.message_handler(state=DirectorStates.note)
     async def director_note(message: types.Message, state: FSMContext) -> None:
         if (message.text or "").strip().lower() == BACK_COMMAND.lower():
-            await handle_back_to_date(message, state)
+            await present_position_step(message, state, "director", via_edit=False)
             return
-        await state.update_data(note=message.text.strip())
+        note_value = (message.text or "").strip()
+        await state.update_data(note=note_value)
         data = await state.get_data()
+        position_value = (data.get("position") or "").strip()
+        if not position_value:
+            await message.answer("Сначала укажите должность.")
+            await present_position_step(
+                message,
+                state,
+                "director",
+                via_edit=False,
+                reminder="Это обязательное поле.",
+            )
+            return
         shops = await fetch_shops()
         selected_shop = shops.get(data.get("shop_id")) if data.get("shop_id") is not None else None
         shop_name = data.get("shop_name") or (selected_shop.name if selected_shop else "Не выбрана")
+        note_display = note_value if note_value else "—"
         summary = (
             "Проверьте заявку:\n"
             f"Дата: {data['date']}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
             f"Лавка: {shop_name}\n"
-            f"Комментарий: {data['note']}"
+            f"Должность: {position_value}\n"
+            f"Комментарий: {note_display}"
         )
         keyboard = InlineKeyboardMarkup().add(
             InlineKeyboardButton("Опубликовать", callback_data="director_confirm"),
@@ -1096,6 +1408,18 @@ def run_director_flow(dispatcher: Dispatcher) -> None:
 
     @dispatcher.callback_query_handler(lambda c: c.data == "director_confirm", state=DirectorStates.confirm)
     async def director_confirm(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        position_value = (data.get("position") or "").strip()
+        if not position_value:
+            await call.answer("Укажите должность", show_alert=True)
+            await present_position_step(
+                call.message,
+                state,
+                "director",
+                via_edit=True,
+                reminder="Это обязательное поле.",
+            )
+            return
         await call.answer()
         await call.message.edit_text("Публикуем заявку...")
         await handle_post_publication(call.message.chat.id, call.from_user, state, "director")
@@ -1527,18 +1851,78 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
             TIME_CONFIRMATION_TEMPLATE.format(time_from=time_from, time_to=time_to),
             reply_markup=ReplyKeyboardRemove(),
         )
-        await state.set_state(WorkerStates.note.state)
-        await message.answer(
-            "Расскажите, на какую должность готовы выйти и оставьте комментарий."
-        )
+        await present_position_step(message, state, "worker", via_edit=False)
+
+    @dispatcher.callback_query_handler(
+        lambda c: c.data and c.data.startswith("worker_position:"),
+        state=WorkerStates.position,
+    )
+    async def worker_position_choice(call: CallbackQuery, state: FSMContext) -> None:
+        try:
+            _, action = (call.data or "").split(":", 1)
+        except ValueError:
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        if action == "back":
+            await call.answer()
+            try:
+                await call.message.edit_reply_markup()
+            except Exception:  # noqa: BLE001
+                pass
+            await prompt_time_range(call.message, state, "worker")
+            return
+        if action == "custom":
+            await call.answer()
+            await call.message.answer(POSITION_CUSTOM_PROMPT)
+            return
+        try:
+            index = int(action)
+        except ValueError:
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        if index < 0 or index >= len(POSITION_BUTTON_OPTIONS):
+            await call.answer("Некорректный выбор", show_alert=True)
+            return
+        position_value = POSITION_BUTTON_OPTIONS[index]
+        await state.update_data(position=position_value)
+        await call.answer("Готово")
+        await proceed_to_note_step("worker", call.message, state, via_edit=True)
+
+    @dispatcher.message_handler(state=WorkerStates.position)
+    async def worker_position_input(message: types.Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer(POSITION_CUSTOM_PROMPT)
+            return
+        if text.lower() == BACK_COMMAND.lower():
+            await prompt_time_range(message, state, "worker")
+            return
+        normalized, error = normalize_position_input(text)
+        if error:
+            await message.answer(f"{error}\n{POSITION_CUSTOM_PROMPT}")
+            return
+        await state.update_data(position=normalized)
+        await proceed_to_note_step("worker", message, state, via_edit=False)
 
     @dispatcher.message_handler(state=WorkerStates.note)
     async def worker_note(message: types.Message, state: FSMContext) -> None:
         if (message.text or "").strip().lower() == BACK_COMMAND.lower():
-            await handle_back_to_date(message, state)
+            await present_position_step(message, state, "worker", via_edit=False)
             return
-        await state.update_data(note=message.text.strip())
+        await state.update_data(note=(message.text or "").strip())
         data = await state.get_data()
+        position_value = (data.get("position") or "").strip()
+        if not position_value:
+            await message.answer("Сначала выберите должность.")
+            await present_position_step(
+                message,
+                state,
+                "worker",
+                via_edit=False,
+                reminder="Это обязательное поле.",
+            )
+            return
+        note_value = (data.get("note") or "").strip()
         shops = await fetch_shops()
         selected_shop = shops.get(data.get("shop_id")) if data.get("shop_id") is not None else None
         shop_name = data.get("shop_name") or (selected_shop.name if selected_shop else "Любая лавка")
@@ -1547,13 +1931,15 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
         metro_line = (
             f"Метро: {station} · {distance} м" if distance is not None else f"Метро: {station}"
         )
+        note_display = note_value if note_value else "—"
         summary = (
             "Проверьте заявку:\n"
             f"Дата: {data['date']}\n"
             f"Смена: {data['time_from']}–{data['time_to']}\n"
             f"Лавка: {shop_name}\n"
             f"{metro_line}\n"
-            f"Пожелания: {data['note']}"
+            f"Желаемая должность: {position_value}\n"
+            f"Пожелания: {note_display}"
         )
         keyboard = InlineKeyboardMarkup().add(
             InlineKeyboardButton("Опубликовать", callback_data="worker_confirm"),
@@ -1571,6 +1957,18 @@ def run_worker_flow(dispatcher: Dispatcher) -> None:
 
     @dispatcher.callback_query_handler(lambda c: c.data == "worker_confirm", state=WorkerStates.confirm)
     async def worker_confirm(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        position_value = (data.get("position") or "").strip()
+        if not position_value:
+            await call.answer("Укажите должность", show_alert=True)
+            await present_position_step(
+                call.message,
+                state,
+                "worker",
+                via_edit=True,
+                reminder="Это обязательное поле.",
+            )
+            return
         await call.answer()
         await call.message.edit_text("Публикуем заявку...")
         await handle_post_publication(call.message.chat.id, call.from_user, state, "worker")
