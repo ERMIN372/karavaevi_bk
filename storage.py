@@ -51,6 +51,11 @@ REQUESTS_HEADERS = [
     "created_at",
     "updated_at",
     "channel_message_id",
+    "max_slots",
+    "picked_ids",
+    "invited_ids",
+    "filled_slots",
+    "end_dt_iso",
 ]
 
 USERS_HEADERS = [
@@ -252,6 +257,92 @@ def _column_letter(index: int) -> str:
 
 REQUESTS_COLUMNS = {name: idx + 1 for idx, name in enumerate(REQUESTS_HEADERS)}
 USERS_COLUMNS = {name: idx + 1 for idx, name in enumerate(USERS_HEADERS)}
+
+
+def _parse_int(value: Any, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_ids(value: Any) -> List[int]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        try:
+            items = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    result: List[int] = []
+    for item in items:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _normalize_request_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    data = {header: row.get(header) for header in REQUESTS_HEADERS}
+    if data.get("id"):
+        try:
+            data["id"] = int(data["id"])
+        except (TypeError, ValueError):
+            data["id"] = None
+    if data.get("shop_id"):
+        try:
+            data["shop_id"] = int(data["shop_id"])
+        except (TypeError, ValueError):
+            data["shop_id"] = None
+    else:
+        data["shop_id"] = None
+    if data.get("chosen_metro_dist_m"):
+        try:
+            data["chosen_metro_dist_m"] = int(float(data["chosen_metro_dist_m"]))
+        except (TypeError, ValueError):
+            data["chosen_metro_dist_m"] = None
+    else:
+        data["chosen_metro_dist_m"] = None
+    if data.get("author_id"):
+        try:
+            data["author_id"] = int(data["author_id"])
+        except (TypeError, ValueError):
+            data["author_id"] = None
+    if data.get("channel_message_id"):
+        try:
+            data["channel_message_id"] = int(data["channel_message_id"])
+        except (TypeError, ValueError):
+            data["channel_message_id"] = None
+    max_slots = _parse_int(data.get("max_slots"), 5)
+    if max_slots <= 0:
+        max_slots = 5
+    if max_slots > 5:
+        max_slots = 5
+    data["max_slots"] = max_slots
+    picked_ids = _parse_ids(data.get("picked_ids"))
+    invited_ids = _parse_ids(data.get("invited_ids"))
+    data["picked_ids"] = picked_ids
+    data["invited_ids"] = invited_ids
+    stored_filled = _parse_int(data.get("filled_slots"), max(len(picked_ids), len(invited_ids)))
+    stored_filled = max(stored_filled, len(picked_ids), len(invited_ids))
+    stored_filled = min(stored_filled, max_slots)
+    data["filled_slots"] = stored_filled
+    end_dt_iso = data.get("end_dt_iso") or ""
+    if isinstance(end_dt_iso, datetime):
+        end_dt_iso = end_dt_iso.isoformat()
+    data["end_dt_iso"] = str(end_dt_iso or "")
+    if not data.get("shop_name") and data.get("shop_id"):
+        record = SHOPS_CACHE.get(data["shop_id"])
+        if record:
+            data["shop_name"] = record.name
+    return data
 
 
 def _parse_bool(value: Any) -> bool:
@@ -635,6 +726,8 @@ def _append_request_sync(payload: Dict[str, Any]) -> Tuple[int, int]:
     now = datetime.now(timezone.utc).isoformat()
     col_values = _requests_ws.col_values(REQUESTS_COLUMNS["id"])[1:]
     request_id, row_number = _next_request_id(col_values)
+    picked_ids = payload.get("picked_ids") or []
+    invited_ids = payload.get("invited_ids") or []
     row = [
         str(request_id),
         payload.get("kind", ""),
@@ -652,6 +745,11 @@ def _append_request_sync(payload: Dict[str, Any]) -> Tuple[int, int]:
         payload.get("created_at", now),
         payload.get("updated_at", now),
         str(payload.get("channel_message_id") or ""),
+        str(payload.get("max_slots") or 5),
+        json.dumps(picked_ids),
+        json.dumps(invited_ids),
+        str(payload.get("filled_slots") or 0),
+        payload.get("end_dt_iso", ""),
     ]
     _requests_ws.append_row(row, value_input_option="USER_ENTERED")
     LOGGER.info("Appended request %s to Google Sheets", request_id)
@@ -714,41 +812,67 @@ def _find_request_sync(request_id: int) -> Optional[Dict[str, Any]]:
     except gspread.exceptions.CellNotFound:
         return None
     row_values = _requests_ws.row_values(cell.row)
-    data: Dict[str, Any] = {}
-    for index, header in enumerate(REQUESTS_HEADERS):
-        data[header] = row_values[index] if index < len(row_values) else ""
-    if data.get("id"):
-        data["id"] = int(data["id"])
-    if data.get("shop_id"):
-        try:
-            data["shop_id"] = int(data["shop_id"])
-        except ValueError:
-            data["shop_id"] = None
-    else:
-        data["shop_id"] = None
-    if data.get("chosen_metro_dist_m"):
-        try:
-            data["chosen_metro_dist_m"] = int(float(data["chosen_metro_dist_m"]))
-        except ValueError:
-            data["chosen_metro_dist_m"] = None
-    else:
-        data["chosen_metro_dist_m"] = None
-    if data.get("author_id"):
-        data["author_id"] = int(data["author_id"])
-    if data.get("channel_message_id"):
-        try:
-            data["channel_message_id"] = int(data["channel_message_id"])
-        except ValueError:
-            data["channel_message_id"] = None
-    if not data.get("shop_name") and data.get("shop_id"):
-        record = SHOPS_CACHE.get(data["shop_id"])
-        if record:
-            data["shop_name"] = record.name
-    return data
+    row_map = {
+        header: row_values[index] if index < len(row_values) else ""
+        for index, header in enumerate(REQUESTS_HEADERS)
+    }
+    return _normalize_request_row(row_map)
 
 
 async def gs_find_request(request_id: int) -> Optional[Dict[str, Any]]:
     return await asyncio.to_thread(_find_request_sync, request_id)
+
+
+def _list_requests_sync() -> List[Dict[str, Any]]:
+    _ensure_initialized()
+    try:
+        records = _requests_ws.get_all_records(expected_headers=REQUESTS_HEADERS)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Не удалось загрузить заявки: %s", exc)
+        return []
+    return [_normalize_request_row(record) for record in records]
+
+
+async def gs_list_requests() -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_list_requests_sync)
+
+
+def _update_request_fields_sync(request_id: int, updates: Dict[str, Any]) -> None:
+    _ensure_initialized()
+    try:
+        cell = _requests_ws.find(str(request_id), in_column=REQUESTS_COLUMNS["id"])
+    except gspread.exceptions.CellNotFound:
+        raise KeyError(f"Request {request_id} not found")
+
+    prepared_updates = []
+    for field, value in updates.items():
+        if field not in REQUESTS_COLUMNS:
+            continue
+        column_index = REQUESTS_COLUMNS[field]
+        cell_ref = rowcol_to_a1(cell.row, column_index)
+        if field in {"picked_ids", "invited_ids"}:
+            if not isinstance(value, str):
+                value = json.dumps(value or [])
+        elif value is None:
+            value = ""
+        prepared_updates.append({"range": cell_ref, "values": [[str(value)]]})
+
+    if not prepared_updates:
+        return
+
+    updated_at_cell = rowcol_to_a1(cell.row, REQUESTS_COLUMNS["updated_at"])
+    prepared_updates.append(
+        {
+            "range": updated_at_cell,
+            "values": [[datetime.now(timezone.utc).isoformat()]],
+        }
+    )
+    _requests_ws.batch_update(prepared_updates)
+    LOGGER.debug("Updated request %s fields: %s", request_id, list(updates.keys()))
+
+
+async def gs_update_request_fields(request_id: int, updates: Dict[str, Any]) -> None:
+    await asyncio.to_thread(_update_request_fields_sync, request_id, updates)
 
 
 def _ensure_user_sync(user: Dict[str, Any]) -> None:
@@ -827,6 +951,8 @@ __all__ = [
     "gs_append_request",
     "gs_update_request_status",
     "gs_find_request",
+    "gs_list_requests",
+    "gs_update_request_fields",
     "gs_ensure_user",
     "gs_get_user",
     "get_shops",
