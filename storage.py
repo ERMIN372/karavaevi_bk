@@ -7,8 +7,10 @@ import base64
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional, Tuple
+from threading import RLock
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gspread
 from gspread.utils import rowcol_to_a1
@@ -37,6 +39,8 @@ REQUESTS_HEADERS = [
     "time_to",
     "shop_id",
     "shop_name",
+    "chosen_metro",
+    "chosen_metro_dist_m",
     "note",
     "author_id",
     "status",
@@ -59,7 +63,34 @@ SHOPS_HEADERS = [
     "id",
     "name",
     "is_active",
+    "metro_1",
+    "dist_1_m",
+    "metro_2",
+    "dist_2_m",
+    "metro_3",
+    "dist_3_m",
 ]
+
+
+@dataclass(frozen=True)
+class ShopMetro:
+    name: str
+    distance_m: int
+
+
+@dataclass(frozen=True)
+class ShopRecord:
+    id: int
+    name: str
+    metros: Tuple[ShopMetro, ...]
+    is_active: bool = True
+
+
+@dataclass(frozen=True)
+class ShopLocation:
+    shop_id: int
+    shop_name: str
+    distance_m: int
 
 
 _client = None
@@ -67,7 +98,11 @@ _spreadsheet = None
 _requests_ws = None
 _users_ws = None
 _shops_ws = None
-SHOPS_CACHE: Dict[int, str] = {}
+SHOPS_CACHE: Dict[int, ShopRecord] = {}
+METRO_CACHE: Dict[str, Tuple[ShopLocation, ...]] = {}
+STATIONS_CACHE: Tuple[str, ...] = ()
+SHOPS_CACHE_UPDATED_AT: Optional[datetime] = None
+_SHOPS_LOCK = RLock()
 
 
 def _decode_service_account() -> Dict[str, Any]:
@@ -81,8 +116,8 @@ def _decode_service_account() -> Dict[str, Any]:
 
 
 def _ensure_initialized() -> None:
-    global _client, _spreadsheet, _requests_ws, _users_ws, _shops_ws, SHOPS_CACHE
-    
+    global _client, _spreadsheet, _requests_ws, _users_ws, _shops_ws
+
     if _client is not None:
         return
     
@@ -102,8 +137,8 @@ def _ensure_initialized() -> None:
     
     _shops_ws = _get_or_create_worksheet(SHOPS_SHEET)
     _ensure_headers(_shops_ws, SHOPS_HEADERS)
-    
-    SHOPS_CACHE = _load_shops_cache()
+
+    _load_shops_cache()
 
 
 def _get_or_create_worksheet(title: str) -> gspread.Worksheet:
@@ -138,39 +173,167 @@ REQUESTS_COLUMNS = {name: idx + 1 for idx, name in enumerate(REQUESTS_HEADERS)}
 USERS_COLUMNS = {name: idx + 1 for idx, name in enumerate(USERS_HEADERS)}
 
 
-def _load_shops_cache() -> Dict[int, str]:
+def _parse_bool(value: Any) -> bool:
+    text = str(value or "1").strip().lower()
+    if not text:
+        return True
+    return text not in {"0", "false", "нет", "no"}
+
+
+def _parse_distance(value: Any, *, row_number: int, column: str, shop_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        distance = int(float(value))
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.lower().replace("м", "").replace("\u00a0", " ").strip()
+        normalized = normalized.replace(",", ".")
+        try:
+            distance = float(normalized)
+        except ValueError:
+            LOGGER.warning(
+                "Не удалось распарсить расстояние '%s' для лавки '%s' (строка %s, колонка %s)",
+                text,
+                shop_name,
+                row_number,
+                column,
+            )
+            return None
+        distance = int(distance)
+    if distance < 0:
+        LOGGER.warning(
+            "Отрицательное расстояние %s для лавки '%s' (строка %s, колонка %s) пропущено",
+            distance,
+            shop_name,
+            row_number,
+            column,
+        )
+        return None
+    return distance
+
+
+def _load_shops_cache() -> None:
+    global SHOPS_CACHE, METRO_CACHE, STATIONS_CACHE, SHOPS_CACHE_UPDATED_AT
+
     if _shops_ws is None:
         raise RuntimeError("Shops worksheet not initialized")
+
     values = _shops_ws.get_all_records(expected_headers=SHOPS_HEADERS)
-    cache: Dict[int, str] = {}
+    shops: Dict[int, ShopRecord] = {}
+    metro_map: Dict[str, Dict[int, int]] = {}
+
     for idx, row in enumerate(values, start=2):
-        raw_id = row.get("id") or ""
-        try:
-            shop_id = int(raw_id)
-        except (TypeError, ValueError):
-            shop_id = idx - 1
+        raw_id = row.get("id")
         name = (row.get("name") or "").strip()
-        active = str(row.get("is_active") or "1").strip()
         if not name:
             continue
-        if active.lower() in {"0", "false", "нет"}:
-            continue
-        cache[shop_id] = name
-    if not cache:
+        try:
+            shop_id = int(raw_id) if raw_id not in (None, "") else idx - 1
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Некорректный идентификатор лавки '%s' в строке %s. Будет использован порядковый номер.",
+                raw_id,
+                idx,
+            )
+            shop_id = idx - 1
+
+        is_active = _parse_bool(row.get("is_active"))
+        metros: List[ShopMetro] = []
+        for suffix in ("1", "2", "3"):
+            station = (row.get(f"metro_{suffix}") or "").strip()
+            distance_value = row.get(f"dist_{suffix}_m")
+            if not station:
+                continue
+            distance = _parse_distance(
+                distance_value,
+                row_number=idx,
+                column=f"dist_{suffix}_m",
+                shop_name=name,
+            )
+            if distance is None:
+                continue
+            metros.append(ShopMetro(name=station, distance_m=distance))
+            metro_map.setdefault(station, {})
+            current = metro_map[station].get(shop_id)
+            if current is None or distance < current:
+                metro_map[station][shop_id] = distance
+
+        record = ShopRecord(id=shop_id, name=name, metros=tuple(metros), is_active=is_active)
+        shops[shop_id] = record
+
+    if not shops:
         LOGGER.warning("Shops sheet is empty – no options will be available")
-    return cache
+
+    metro_cache: Dict[str, Tuple[ShopLocation, ...]] = {}
+    for station, per_shop in metro_map.items():
+        locations = [
+            ShopLocation(shop_id=s_id, shop_name=shops[s_id].name, distance_m=dist)
+            for s_id, dist in per_shop.items()
+            if shops.get(s_id) and shops[s_id].is_active
+        ]
+        if not locations:
+            continue
+        locations.sort(key=lambda item: (item.distance_m, item.shop_name.lower()))
+        metro_cache[station] = tuple(locations)
+
+    stations = tuple(sorted(metro_cache.keys(), key=lambda value: value.lower()))
+
+    with _SHOPS_LOCK:
+        SHOPS_CACHE = shops
+        METRO_CACHE = metro_cache
+        STATIONS_CACHE = stations
+        SHOPS_CACHE_UPDATED_AT = datetime.now(timezone.utc)
 
 
-def get_shops() -> Dict[int, str]:
+def get_shops() -> Dict[int, ShopRecord]:
     """Return cached shops mapping."""
+
     _ensure_initialized()
-    return dict(SHOPS_CACHE)
+    with _SHOPS_LOCK:
+        return {
+            shop_id: record
+            for shop_id, record in SHOPS_CACHE.items()
+            if record.is_active
+        }
 
 
 def get_shop_name(shop_id: Optional[int]) -> Optional[str]:
     if shop_id is None:
         return None
-    return SHOPS_CACHE.get(shop_id)
+    _ensure_initialized()
+    with _SHOPS_LOCK:
+        record = SHOPS_CACHE.get(shop_id)
+        return record.name if record else None
+
+
+def get_station_names() -> Tuple[str, ...]:
+    _ensure_initialized()
+    with _SHOPS_LOCK:
+        return STATIONS_CACHE
+
+
+def get_station_shops(station: str) -> Tuple[ShopLocation, ...]:
+    _ensure_initialized()
+    with _SHOPS_LOCK:
+        return METRO_CACHE.get(station, tuple())
+
+
+def get_shops_updated_at() -> Optional[datetime]:
+    _ensure_initialized()
+    with _SHOPS_LOCK:
+        return SHOPS_CACHE_UPDATED_AT
+
+
+def _refresh_shops_cache_sync() -> None:
+    _ensure_initialized()
+    _load_shops_cache()
+
+
+async def refresh_shops_cache() -> None:
+    await asyncio.to_thread(_refresh_shops_cache_sync)
 
 
 def _next_request_id(ids: Iterable[str]) -> Tuple[int, int]:
@@ -198,6 +361,8 @@ def _append_request_sync(payload: Dict[str, Any]) -> Tuple[int, int]:
         payload.get("time_to", ""),
         str(payload.get("shop_id") or ""),
         payload.get("shop_name", ""),
+        payload.get("chosen_metro", ""),
+        str(payload.get("chosen_metro_dist_m") or ""),
         payload.get("note", ""),
         str(payload.get("author_id") or ""),
         payload.get("status", "open"),
@@ -278,6 +443,13 @@ def _find_request_sync(request_id: int) -> Optional[Dict[str, Any]]:
             data["shop_id"] = None
     else:
         data["shop_id"] = None
+    if data.get("chosen_metro_dist_m"):
+        try:
+            data["chosen_metro_dist_m"] = int(float(data["chosen_metro_dist_m"]))
+        except ValueError:
+            data["chosen_metro_dist_m"] = None
+    else:
+        data["chosen_metro_dist_m"] = None
     if data.get("author_id"):
         data["author_id"] = int(data["author_id"])
     if data.get("channel_message_id"):
@@ -286,7 +458,9 @@ def _find_request_sync(request_id: int) -> Optional[Dict[str, Any]]:
         except ValueError:
             data["channel_message_id"] = None
     if not data.get("shop_name") and data.get("shop_id"):
-        data["shop_name"] = SHOPS_CACHE.get(data["shop_id"])
+        record = SHOPS_CACHE.get(data["shop_id"])
+        if record:
+            data["shop_name"] = record.name
     return data
 
 
