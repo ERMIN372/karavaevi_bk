@@ -163,7 +163,6 @@ POSITION_PROMPTS: Dict[str, str] = {
     "director": "Укажите требуемую должность. Можно выбрать кнопку или ввести свою.",
     "worker": "Укажите желаемую должность. Можно выбрать кнопку или ввести свою.",
 }
-POSITION_CUSTOM_BUTTON = "Другая…"
 POSITION_BACK_BUTTON = "⬅️ Назад"
 POSITION_CUSTOM_PROMPT = (
     "Введите должность текстом. От 2 до 30 символов. Допустимы буквы, пробел и дефис."
@@ -279,9 +278,6 @@ def build_position_keyboard(flow: str) -> InlineKeyboardMarkup:
             )
         )
     markup.row(
-        InlineKeyboardButton(
-            POSITION_CUSTOM_BUTTON, callback_data=f"{flow}_position:custom"
-        ),
         InlineKeyboardButton(
             POSITION_BACK_BUTTON, callback_data=f"{flow}_position:back"
         ),
