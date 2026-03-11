@@ -50,7 +50,7 @@ def now_in_timezone() -> datetime:
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN is required. Please set it in Replit Secrets.\n"
+        "BOT_TOKEN is required. Please set it in Railway Variables (Settings → Variables).\n"
         "Also required: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64, GOOGLE_SPREADSHEET_ID, "
         "CHANNEL_ID, TECH_CHAT_ID, ADMINS"
     )
