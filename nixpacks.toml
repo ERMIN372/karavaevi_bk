@@ -1,8 +1,9 @@
 [phases.setup]
 nixPkgs = ["python311", "gcc"]
+aptPkgs = []
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python3.11 -m pip install -r requirements.txt"]
 
 [start]
-cmd = "python main.py"
+cmd = "python3.11 main.py"
